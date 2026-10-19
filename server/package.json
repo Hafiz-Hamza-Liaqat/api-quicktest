@@ -1,0 +1,9 @@
+{
+  "name": "api-quicktest-server",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "tsc -p ../tsconfig.server.json"
+  }
+}
