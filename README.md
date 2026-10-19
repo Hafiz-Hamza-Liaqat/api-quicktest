@@ -182,23 +182,61 @@ npm run dev:server
 
 ---
 
-## Test Suites & Verification
+### Test Suites & Verification
 
-API QuickTest includes 100% automated test coverage across unit, component, security, and browser E2E workflows:
+API QuickTest includes automated test coverage across unit, component, security, and browser E2E workflows:
 
 ```bash
-# Run Vitest unit & component tests (45 tests)
+# Run Vitest unit & integration tests (66 tests across 10 suites)
 npm test
 
-# Run Playwright E2E browser tests (13 core workflows)
+# Run Playwright E2E browser tests (14 core workflows)
 npm run test:e2e
 
-# Run linter
+# Run linter (oxlint)
 npm run lint
 
 # Build verification (client & server bundles)
 npm run build
+npm run verify:build
 ```
+
+---
+
+## Security & Privacy Hardening
+
+API QuickTest v1.0 implements defense-in-depth architectural security controls across both the browser client and Node.js proxy:
+
+1. **Zero-Secret Persistence by Default**:
+   - `saveCollections()` and `saveEnvironments()` automatically sanitize credentials before writing to browser `localStorage` or generating JSON export files.
+   - Sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, API keys), bearer tokens, basic-auth passwords, secret environment variables, sensitive query parameters (`?token=`, `?apiKey=`, `?secret=`), and sensitive JSON body fields (`password`, `client_secret`, `token`) are stripped by default.
+   - Collection file imports are verified and sanitized upon ingestion to protect against untrusted shared files.
+
+2. **Cross-Origin Redirect & Credential Leakage Prevention**:
+   - The `/proxy` redirect loop validates every hop against complete SSRF rules.
+   - Compares the redirect destination origin against the current origin. If cross-origin, any request containing authentication or sensitive headers is strictly rejected with HTTP 403 `CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED`.
+   - Non-sensitive cross-origin redirects strip residual auth headers before forwarding.
+   - RFC 9110 redirect semantics are enforced: 301 and 302 convert POST to GET (dropping the body), 303 converts to GET (dropping the body), and 307/308 strictly preserve the method and body.
+   - Redirect loop detection (`REDIRECT_LOOP_DETECTED`) and hop limits (maximum 5 redirects) prevent infinite proxy looping.
+
+3. **Rate Limiting with Trusted Proxy IP Validation**:
+   - Caller-supplied `X-Forwarded-For` headers are never blindly trusted.
+   - Configurable `TRUST_PROXY=1` option for deployment behind Render, Cloudflare, or AWS reverse proxies, extracting the validated client IP from the trusted hop.
+   - In direct or development environments, strictly uses the socket remote address to prevent rate-limit evasion.
+
+4. **Hardened SSRF IP Classification & DNS Pinning**:
+   - Uses `ipaddr.js` for RFC-compliant IP range classification across IPv4 and IPv6.
+   - Classifies and blocks Carrier-Grade NAT (`100.64.0.0/10`), Benchmarking (`198.18.0.0/15`), cloud metadata (`169.254.169.254`), documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`), multicast, and loopback.
+   - Detects IPv4-mapped IPv6 in both dotted (`::ffff:127.0.0.1`) and hexadecimal (`::ffff:7f00:1`) notation.
+   - DNS Agent Pinning (`createPinnedAgent`) pins upstream connections to the pre-validated IP address, mitigating Time-Of-Check to Time-Of-Use (TOCTOU) DNS Rebinding attacks.
+
+5. **Streaming Response Size Limits**:
+   - In Direct Mode, responses are read incrementally using `ReadableStream` reader chunk decoding.
+   - If the accumulated body exceeds `MAX_RESPONSE_BYTES` (5 MB), `reader.cancel()` immediately aborts upstream consumption to protect browser memory and network bandwidth.
+   - In Proxy Mode, response chunks are counted and truncated at 5 MB maximum.
+
+6. **Remote Deployment Guard**:
+   - When hosted on GitHub Pages or remote static hosts without a configured `VITE_API_PROXY_URL`, the client displays a clear unconfigured notice rather than silently failing to connect to `localhost:3001`.
 
 ---
 
@@ -219,6 +257,7 @@ Deploy the Node.js proxy service using the included [`render.yaml`](render.yaml)
    - `ALLOWED_ORIGINS`: `https://hafiz-hamza-liaqat.github.io,http://localhost:5173`
    - `RATE_LIMIT_MAX`: `120`
    - `ALLOW_LOCALHOST`: `false`
+   - `TRUST_PROXY`: `1`
 4. Verify deployment health at `https://<your-render-service>.onrender.com/health`.
 
 ---
@@ -233,6 +272,7 @@ Deploy the Node.js proxy service using the included [`render.yaml`](render.yaml)
 | `RATE_LIMIT_MAX` | Backend | Maximum proxy requests per minute per IP | `120` |
 | `ALLOWED_ORIGINS` | Backend | Comma-separated allowed CORS origins | `http://localhost:5173,...` |
 | `ALLOW_LOCALHOST` | Backend | Permit loopback targets (strictly for dev testing) | `false` |
+| `TRUST_PROXY` | Backend | Number of trusted reverse proxy hops (e.g. `1` on Render) | `1` |
 
 ---
 
@@ -240,7 +280,7 @@ Deploy the Node.js proxy service using the included [`render.yaml`](render.yaml)
 
 - **Browser CORS**: In Direct Mode, the browser enforces the Same-Origin Policy. If a target server does not send `Access-Control-Allow-Origin`, direct requests will fail. Switch to Proxy Mode to inspect such endpoints.
 - **Public Proxy Hosting**: A publicly accessible proxy carries inherent abuse risks. The included proxy features rate limiting, strict SSRF blocks, and body limits, but should be restricted in production to your specific frontend origin.
-- **Client-Side Secret Storage**: Local environment variables and tokens stored in the browser's localStorage are intended for convenience during local development. Do not store sensitive production master keys in untrusted browsers.
+- **Client-Side Secret Storage**: Local environment variables and tokens stored in the browser's localStorage are sanitized by default. Do not store production master secrets in shared or untrusted browsers.
 
 ---
 

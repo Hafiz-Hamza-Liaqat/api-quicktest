@@ -18,3 +18,5 @@ services:
         value: https://hafiz-hamza-liaqat.github.io,http://localhost:5173
       - key: ALLOW_LOCALHOST
         value: "false"
+      - key: TRUST_PROXY
+        value: "1"

@@ -2,7 +2,7 @@ import type { EnvironmentVariable, RequestModel, ResponseSummary } from '../type
 import { buildFinalHeaders } from '../utils/headers'
 import { buildFinalUrl } from '../utils/url'
 
-const MAX_RESPONSE_BYTES = 5 * 1024 * 1024 // 5 MB
+export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024 // 5 MB
 
 export interface ExecutionOptions {
   signal?: AbortSignal
@@ -115,7 +115,51 @@ async function executeDirect(
       signal,
     })
 
-    const rawBody = await fetchResponse.text()
+    let displayBody = ''
+    let sizeBytes = 0
+    let isTruncated = false
+
+    // Enforce size limit while streaming to avoid buffering unbounded responses
+    if (fetchResponse.body && typeof fetchResponse.body.getReader === 'function') {
+      const reader = fetchResponse.body.getReader()
+      const decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true })
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value && value.byteLength > 0) {
+            sizeBytes += value.byteLength
+            if (sizeBytes > MAX_RESPONSE_BYTES) {
+              const overflow = sizeBytes - MAX_RESPONSE_BYTES
+              const bytesToKeep = value.byteLength - overflow
+              if (bytesToKeep > 0) {
+                displayBody += decoder.decode(value.subarray(0, bytesToKeep), { stream: false })
+              }
+              isTruncated = true
+              // Cancel reader early to stop network stream and conserve browser memory
+              await reader.cancel('Response body limit of 5MB reached')
+              break
+            } else {
+              displayBody += decoder.decode(value, { stream: true })
+            }
+          }
+        }
+      } catch (streamErr: any) {
+        if (signal.aborted) throw streamErr
+        if (!isTruncated) throw streamErr
+      }
+    } else {
+      const rawBody = await fetchResponse.text()
+      sizeBytes = new Blob([rawBody]).size
+      if (sizeBytes > MAX_RESPONSE_BYTES) {
+        isTruncated = true
+        displayBody = rawBody.slice(0, MAX_RESPONSE_BYTES)
+      } else {
+        displayBody = rawBody
+      }
+    }
+
     const clientDurationMs = Math.round(performance.now() - startTime)
 
     // Parse response headers
@@ -125,14 +169,16 @@ async function executeDirect(
     })
 
     const contentType = fetchResponse.headers.get('content-type') || 'text/plain'
-    const sizeBytes = new Blob([rawBody]).size
-    const isTruncated = sizeBytes > MAX_RESPONSE_BYTES
-    const displayBody = isTruncated ? rawBody.slice(0, MAX_RESPONSE_BYTES) : rawBody
 
     let isJson = false
     let jsonParsed: any = undefined
 
-    if (displayBody.trim() && (contentType.includes('json') || displayBody.trim().startsWith('{') || displayBody.trim().startsWith('['))) {
+    if (
+      displayBody.trim() &&
+      (contentType.includes('json') ||
+        displayBody.trim().startsWith('{') ||
+        displayBody.trim().startsWith('['))
+    ) {
       try {
         jsonParsed = JSON.parse(displayBody)
         isJson = true
@@ -194,10 +240,37 @@ async function executeViaProxy(
   startTime: number,
   proxyBaseUrl?: string
 ): Promise<ResponseSummary> {
-  const proxyUrl =
-    proxyBaseUrl ||
-    (typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_PROXY_URL) ||
-    'http://localhost:3001'
+  const envProxyUrl =
+    typeof import.meta !== 'undefined' ? import.meta.env?.VITE_API_PROXY_URL : undefined
+  const isBrowser = typeof window !== 'undefined'
+  const isLocalhost =
+    isBrowser && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+
+  let proxyUrl = proxyBaseUrl || envProxyUrl
+  if (!proxyUrl) {
+    if (isLocalhost || !isBrowser) {
+      proxyUrl = 'http://localhost:3001'
+    } else {
+      // Remote deployment (e.g. GitHub Pages) with unconfigured proxy URL
+      return {
+        status: 0,
+        statusText: 'Proxy Unconfigured',
+        clientDurationMs: 0,
+        sizeBytes: 0,
+        contentType: 'text/plain',
+        requestUrl: finalUrl,
+        requestMethod: request.method,
+        headers: {},
+        body: '',
+        isJson: false,
+        isTruncated: false,
+        networkError: true,
+        error:
+          'Proxy backend URL is unconfigured. When hosted on GitHub Pages, configure VITE_API_PROXY_URL pointing to your deployed Render proxy service, or switch to Direct Mode.',
+        timestamp: Date.now(),
+      }
+    }
+  }
 
   const proxyEndpoint = `${proxyUrl.replace(/\/+$/, '')}/proxy`
 

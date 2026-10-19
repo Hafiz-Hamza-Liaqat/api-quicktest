@@ -3,6 +3,7 @@ import {
   isPrivateOrReservedIp,
   isPrivateOrReservedIpv4,
   isPrivateOrReservedIpv6,
+  pinnedLookup,
   validateDestinationUrl,
 } from '../src/security'
 import { MemoryRateLimiter } from '../src/rateLimiter'
@@ -21,6 +22,22 @@ describe('SSRF Protection - IP Range Checking', () => {
     // 192.168.0.0/16
     expect(isPrivateOrReservedIpv4('192.168.1.1')).toBe(true)
     expect(isPrivateOrReservedIpv4('192.168.100.50')).toBe(true)
+  })
+
+  it('blocks Carrier-Grade NAT (100.64.0.0/10) and Benchmarking (198.18.0.0/15) ranges', () => {
+    // CGNAT (RFC 6598)
+    expect(isPrivateOrReservedIpv4('100.64.0.1')).toBe(true)
+    expect(isPrivateOrReservedIpv4('100.100.50.25')).toBe(true)
+    expect(isPrivateOrReservedIpv4('100.127.255.254')).toBe(true)
+
+    // Benchmarking (RFC 2544)
+    expect(isPrivateOrReservedIpv4('198.18.0.1')).toBe(true)
+    expect(isPrivateOrReservedIpv4('198.19.255.254')).toBe(true)
+
+    // Documentation ranges (TEST-NET-1, 2, 3)
+    expect(isPrivateOrReservedIpv4('192.0.2.1')).toBe(true)
+    expect(isPrivateOrReservedIpv4('198.51.100.1')).toBe(true)
+    expect(isPrivateOrReservedIpv4('203.0.113.1')).toBe(true)
   })
 
   it('blocks AWS and Cloud Metadata IPs (169.254.169.254)', () => {
@@ -42,22 +59,51 @@ describe('SSRF Protection - IP Range Checking', () => {
     expect(isPrivateOrReservedIpv4('142.250.190.46')).toBe(false)
   })
 
-  it('blocks private and loopback IPv6 ranges', () => {
+  it('blocks private, loopback, and IPv4-mapped IPv6 ranges in dotted and hex formats', () => {
     expect(isPrivateOrReservedIpv6('::1')).toBe(true) // Loopback
     expect(isPrivateOrReservedIpv6('::')).toBe(true) // Unspecified
     expect(isPrivateOrReservedIpv6('fe80::1')).toBe(true) // Link-local
     expect(isPrivateOrReservedIpv6('fc00::1')).toBe(true) // Unique local
     expect(isPrivateOrReservedIpv6('fd12:3456:789a::1')).toBe(true) // Unique local
     expect(isPrivateOrReservedIpv6('ff02::1')).toBe(true) // Multicast
-    expect(isPrivateOrReservedIpv6('::ffff:127.0.0.1')).toBe(true) // IPv4-mapped loopback
-    expect(isPrivateOrReservedIpv6('::ffff:169.254.169.254')).toBe(true) // IPv4-mapped metadata
+    expect(isPrivateOrReservedIpv6('100::1')).toBe(true) // Discard prefix
+    expect(isPrivateOrReservedIpv6('2001:db8::1')).toBe(true) // Documentation prefix
+
+    // IPv4-mapped IPv6 in dotted decimal notation
+    expect(isPrivateOrReservedIpv6('::ffff:127.0.0.1')).toBe(true)
+    expect(isPrivateOrReservedIpv6('::ffff:169.254.169.254')).toBe(true)
+    expect(isPrivateOrReservedIpv6('::ffff:10.0.0.1')).toBe(true)
+
+    // IPv4-mapped IPv6 in hexadecimal notation (regression tests)
+    expect(isPrivateOrReservedIpv6('::ffff:7f00:1')).toBe(true) // 127.0.0.1 in hex
+    expect(isPrivateOrReservedIpv6('::ffff:a9fe:a9fe')).toBe(true) // 169.254.169.254 in hex
+    expect(isPrivateOrReservedIpv6('::ffff:0a00:0001')).toBe(true) // 10.0.0.1 in hex
+
+    // Public IPv6
+    expect(isPrivateOrReservedIpv6('2607:f8b0:4005:805::200e')).toBe(false)
+    expect(isPrivateOrReservedIpv6('::ffff:8.8.8.8')).toBe(false)
   })
 
   it('handles general isPrivateOrReservedIp helper', () => {
     expect(isPrivateOrReservedIp('127.0.0.1')).toBe(true)
     expect(isPrivateOrReservedIp('::1')).toBe(true)
+    expect(isPrivateOrReservedIp('::ffff:7f00:1')).toBe(true)
+    expect(isPrivateOrReservedIp('100.64.0.5')).toBe(true)
     expect(isPrivateOrReservedIp('1.1.1.1')).toBe(false)
     expect(isPrivateOrReservedIp('invalid-ip-string')).toBe(true)
+  })
+
+  it('proves DNS pinning agent resolves directly to pinned IP preventing rebinding', () => {
+    let resolvedTarget = ''
+    let resolvedFamily = 0
+
+    pinnedLookup('93.184.216.34', 'attacker-rebound.com', {}, (_err, addr, fam) => {
+      resolvedTarget = addr
+      resolvedFamily = fam || 4
+    })
+
+    expect(resolvedTarget).toBe('93.184.216.34')
+    expect(resolvedFamily).toBe(4)
   })
 })
 

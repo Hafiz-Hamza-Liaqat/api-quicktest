@@ -1,4 +1,51 @@
-import type { AuthConfig, CollectionItem, EnvironmentProfile, RequestModel } from '../types'
+import type {
+  AuthConfig,
+  CollectionItem,
+  EnvironmentProfile,
+  KeyValuePair,
+  RequestBodyConfig,
+  RequestModel,
+} from '../types'
+
+/**
+ * Checks if a header name represents a sensitive credential or secret.
+ */
+export function isSensitiveHeaderName(name: string): boolean {
+  const lower = name.toLowerCase().trim()
+  return (
+    lower === 'authorization' ||
+    lower === 'proxy-authorization' ||
+    lower === 'cookie' ||
+    lower === 'cookie2' ||
+    lower === 'set-cookie' ||
+    lower.includes('token') ||
+    lower.includes('secret') ||
+    lower.includes('password') ||
+    lower.includes('apikey') ||
+    lower.includes('api-key') ||
+    lower.includes('api_key')
+  )
+}
+
+/**
+ * Checks if a query parameter key represents a credential or secret token.
+ */
+export function isSensitiveQueryParam(key: string): boolean {
+  const lower = key.toLowerCase().trim()
+  return (
+    lower === 'api_key' ||
+    lower === 'apikey' ||
+    lower === 'key' ||
+    lower === 'token' ||
+    lower === 'access_token' ||
+    lower === 'auth' ||
+    lower === 'secret' ||
+    lower === 'client_secret' ||
+    lower === 'password' ||
+    lower === 'pass' ||
+    lower === 'pwd'
+  )
+}
 
 /**
  * Strips secret authentication fields from an AuthConfig object.
@@ -18,25 +65,99 @@ export function sanitizeAuthConfig(auth: AuthConfig): AuthConfig {
 }
 
 /**
+ * Redacts credential values from query parameters.
+ */
+export function sanitizeQueryParams(params: KeyValuePair[]): KeyValuePair[] {
+  return params.map((p) => {
+    if (isSensitiveQueryParam(p.key)) {
+      return { ...p, value: '' }
+    }
+    return { ...p }
+  })
+}
+
+/**
+ * Redacts credentials from embedded query strings in URL strings (e.g. ?token=secret).
+ */
+export function sanitizeUrlCredentials(url: string): string {
+  if (!url) return ''
+  return url.replace(
+    /([?&](?:api_key|apikey|key|token|access_token|auth|secret|client_secret|password|pwd|pass)=)[^&#]*/gi,
+    '$1'
+  )
+}
+
+/**
+ * Redacts common credential fields from request bodies.
+ */
+export function sanitizeRequestBody(body: RequestBodyConfig): RequestBodyConfig {
+  if (body.type !== 'json' || !body.rawText.trim()) {
+    return { ...body }
+  }
+
+  try {
+    const parsed = JSON.parse(body.rawText)
+    const redactObject = (obj: any): any => {
+      if (obj === null || typeof obj !== 'object') return obj
+      if (Array.isArray(obj)) return obj.map(redactObject)
+
+      const result: Record<string, any> = {}
+      for (const [key, val] of Object.entries(obj)) {
+        const lower = key.toLowerCase().trim()
+        if (
+          lower === 'password' ||
+          lower === 'passwd' ||
+          lower === 'pwd' ||
+          lower === 'secret' ||
+          lower === 'client_secret' ||
+          lower === 'token' ||
+          lower === 'access_token' ||
+          lower === 'refresh_token' ||
+          lower === 'apikey' ||
+          lower === 'api_key' ||
+          lower === 'private_key'
+        ) {
+          result[key] = ''
+        } else if (typeof val === 'object' && val !== null) {
+          result[key] = redactObject(val)
+        } else {
+          result[key] = val
+        }
+      }
+      return result
+    }
+
+    const redacted = redactObject(parsed)
+    return {
+      ...body,
+      rawText: JSON.stringify(redacted, null, 2),
+    }
+  } catch {
+    return { ...body }
+  }
+}
+
+/**
  * Sanitizes a RequestModel by redacting secrets before saving to history, collections, or exports.
  */
 export function sanitizeRequestModel(req: RequestModel): RequestModel {
   return {
     ...req,
+    url: sanitizeUrlCredentials(req.url),
+    queryParams: sanitizeQueryParams(req.queryParams),
     auth: sanitizeAuthConfig(req.auth),
     headers: req.headers.map((h) => {
-      // If a header is Authorization or looks like a secret, strip or mask it
-      const lower = h.key.toLowerCase().trim()
-      if (lower === 'authorization' || lower.includes('token') || lower.includes('secret') || lower.includes('password') || lower.includes('apikey') || lower.includes('api-key')) {
+      if (isSensitiveHeaderName(h.key)) {
         return { ...h, value: '' }
       }
       return { ...h }
     }),
+    body: sanitizeRequestBody(req.body),
   }
 }
 
 /**
- * Redacts secrets from an EnvironmentProfile before export or untrusted persistence.
+ * Redacts secrets from an EnvironmentProfile before export or persistent storage.
  */
 export function sanitizeEnvironmentProfile(profile: EnvironmentProfile): EnvironmentProfile {
   return {
@@ -51,14 +172,19 @@ export function sanitizeEnvironmentProfile(profile: EnvironmentProfile): Environ
 }
 
 /**
- * Sanitizes an array of collections for export.
+ * Sanitizes an array of collections for export or storage.
  */
-export function sanitizeCollectionsForExport(collections: CollectionItem[]): CollectionItem[] {
+export function sanitizeCollections(collections: CollectionItem[]): CollectionItem[] {
   return collections.map((col) => ({
     ...col,
     requests: col.requests.map((r) => sanitizeRequestModel(r)),
   }))
 }
+
+/**
+ * Alias for backward compatibility
+ */
+export const sanitizeCollectionsForExport = sanitizeCollections
 
 /**
  * Strips secrets from a request config when appending to History.

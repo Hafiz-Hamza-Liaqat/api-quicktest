@@ -46,6 +46,29 @@ app.use(
   })
 )
 
+// Configure trusted proxy behavior
+// When running behind Render or another trusted reverse proxy, set TRUST_PROXY=1 (or number of hops).
+// In direct connection mode or development, TRUST_PROXY is unset and X-Forwarded-For is not blindly trusted.
+const TRUST_PROXY_CONFIG = process.env.TRUST_PROXY
+if (TRUST_PROXY_CONFIG) {
+  const hopNum = parseInt(TRUST_PROXY_CONFIG, 10)
+  app.set('trust proxy', isNaN(hopNum) ? TRUST_PROXY_CONFIG : hopNum)
+} else {
+  app.set('trust proxy', false)
+}
+
+/**
+ * Derives a trustworthy client IP for rate limiting.
+ * If trust proxy is configured, uses Express's verified req.ip.
+ * Otherwise, falls back strictly to req.socket.remoteAddress to prevent spoofing via X-Forwarded-For.
+ */
+export function getClientIp(req: Request): string {
+  if (req.app.get('trust proxy')) {
+    return req.ip || req.socket.remoteAddress || 'unknown'
+  }
+  return req.socket.remoteAddress || 'unknown'
+}
+
 // Security headers
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -175,6 +198,45 @@ app.get('/api/test/delay/:ms', async (req: Request, res: Response) => {
   })
 })
 
+// Deterministic redirect test endpoints
+app.get('/api/test/redirect/same-origin', (_req: Request, res: Response) => {
+  res.redirect(302, '/api/test/users')
+})
+
+app.get('/api/test/redirect/loop-a', (_req: Request, res: Response) => {
+  res.redirect(302, '/api/test/redirect/loop-b')
+})
+
+app.get('/api/test/redirect/loop-b', (_req: Request, res: Response) => {
+  res.redirect(302, '/api/test/redirect/loop-a')
+})
+
+app.get('/api/test/redirect/chain/:step', (req: Request, res: Response) => {
+  const step = parseInt(parseParamString(req.params.step), 10) || 1
+  if (step >= 10) {
+    res.status(200).json({ finalStep: step })
+  } else {
+    res.redirect(302, `/api/test/redirect/chain/${step + 1}`)
+  }
+})
+
+app.get('/api/test/redirect/to-private', (_req: Request, res: Response) => {
+  res.redirect(302, 'http://169.254.169.254/latest/meta-data')
+})
+
+app.all('/api/test/echo', (req: Request, res: Response) => {
+  res.status(200).json({
+    method: req.method,
+    headers: req.headers,
+    body: req.body,
+  })
+})
+
+app.all('/api/test/redirect/status/:code', (req: Request, res: Response) => {
+  const code = parseInt(parseParamString(req.params.code), 10) || 302
+  res.redirect(code, '/api/test/echo')
+})
+
 // -------------------------------------------------------------
 // 3. Secure Proxy Endpoint
 // -------------------------------------------------------------
@@ -187,8 +249,8 @@ interface ProxyRequestBody {
 }
 
 app.post('/proxy', async (req: Request, res: Response) => {
-  // Rate limiting check
-  const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
+  // Hardened Rate limiting check using validated client IP
+  const clientIp = getClientIp(req)
   const rateResult = rateLimiter.check(clientIp)
 
   res.setHeader('X-RateLimit-Limit', rateResult.limit.toString())
@@ -220,10 +282,14 @@ app.post('/proxy', async (req: Request, res: Response) => {
   const allowLocalhostInDev = process.env.NODE_ENV !== 'production' || process.env.ALLOW_LOCALHOST === 'true'
 
   let currentUrl = url
+  let currentMethod = upperMethod
+  let currentBody: string | undefined = body
+  let currentHeaders: Record<string, string> = { ...headers }
   let redirectsCount = 0
+  const visitedUrls = new Set<string>([url])
 
   while (redirectsCount <= MAX_REDIRECTS) {
-    // SSRF Validation
+    // SSRF Validation for current target hop
     const validation = await validateDestinationUrl(currentUrl, allowLocalhostInDev)
     if (!validation.allowed || !validation.resolvedIp) {
       res.status(403).json({
@@ -238,9 +304,9 @@ app.post('/proxy', async (req: Request, res: Response) => {
       const isHttps = parsedCurrentUrl.protocol === 'https:'
       const agent = createPinnedAgent(validation.resolvedIp, isHttps)
 
-      // Filter prohibited or dangerous headers before forwarding
+      // Filter prohibited or hop-by-hop headers before forwarding
       const forwardedHeaders: Record<string, string> = {}
-      for (const [k, v] of Object.entries(headers)) {
+      for (const [k, v] of Object.entries(currentHeaders)) {
         const lower = k.toLowerCase().trim()
         if (
           lower === 'host' ||
@@ -255,7 +321,6 @@ app.post('/proxy', async (req: Request, res: Response) => {
       forwardedHeaders['Host'] = parsedCurrentUrl.host
 
       const effectiveTimeout = Math.min(Math.max(timeoutMs, 1000), 60000)
-
       const upstreamStart = performance.now()
 
       const upstreamResult = await new Promise<{
@@ -272,7 +337,7 @@ app.post('/proxy', async (req: Request, res: Response) => {
           hostname: parsedCurrentUrl.hostname,
           port: validation.port,
           path: `${parsedCurrentUrl.pathname}${parsedCurrentUrl.search}`,
-          method: upperMethod,
+          method: currentMethod,
           headers: forwardedHeaders,
           agent,
           timeout: effectiveTimeout,
@@ -320,8 +385,8 @@ app.post('/proxy', async (req: Request, res: Response) => {
         })
 
         // Write body if applicable
-        if (upperMethod !== 'GET' && body) {
-          upstreamReq.write(body)
+        if (currentMethod !== 'GET' && currentBody) {
+          upstreamReq.write(currentBody)
         }
 
         upstreamReq.end()
@@ -329,7 +394,7 @@ app.post('/proxy', async (req: Request, res: Response) => {
 
       const upstreamDurationMs = Math.round(performance.now() - upstreamStart)
 
-      // Check for redirect (301, 302, 303, 307, 308)
+      // Check for HTTP redirect status codes (301, 302, 303, 307, 308)
       if (
         [301, 302, 303, 307, 308].includes(upstreamResult.status) &&
         upstreamResult.location
@@ -343,9 +408,93 @@ app.post('/proxy', async (req: Request, res: Response) => {
           return
         }
 
-        // Resolve relative redirect against current URL
-        currentUrl = new URL(upstreamResult.location, currentUrl).toString()
-        continue // Loop to re-validate new target with SSRF checks!
+        let nextUrl: string
+        try {
+          nextUrl = new URL(upstreamResult.location, currentUrl).toString()
+        } catch {
+          res.status(502).json({
+            error: `Malformed redirect location received from upstream: "${upstreamResult.location}".`,
+            code: 'INVALID_REDIRECT_LOCATION',
+          })
+          return
+        }
+
+        // Loop detection
+        if (visitedUrls.has(nextUrl)) {
+          res.status(502).json({
+            error: `Redirect loop detected: destination "${nextUrl}" was already visited.`,
+            code: 'REDIRECT_LOOP_DETECTED',
+          })
+          return
+        }
+        visitedUrls.add(nextUrl)
+
+        const currentOrigin = new URL(currentUrl).origin
+        const nextOrigin = new URL(nextUrl).origin
+        const isCrossOrigin = currentOrigin !== nextOrigin
+
+        if (isCrossOrigin) {
+          // Reject cross-origin redirects if credentials or secrets are present
+          const hasSensitiveCredentials = Object.keys(currentHeaders).some((k) => {
+            const lower = k.toLowerCase().trim()
+            return (
+              lower === 'authorization' ||
+              lower === 'proxy-authorization' ||
+              lower === 'cookie' ||
+              lower === 'cookie2' ||
+              lower === 'set-cookie' ||
+              lower.includes('token') ||
+              lower.includes('secret') ||
+              lower.includes('password') ||
+              lower.includes('apikey') ||
+              lower.includes('api-key') ||
+              lower.includes('api_key')
+            )
+          })
+
+          if (hasSensitiveCredentials) {
+            res.status(403).json({
+              error: `Cross-origin redirect rejected: Request contains sensitive credentials (Authorization / API Key / Cookie) that cannot be safely forwarded to a different origin ("${nextOrigin}").`,
+              code: 'CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED',
+            })
+            return
+          }
+
+          // Strip any residual auth/cookie headers before redirecting across origins
+          const sanitizedHeaders: Record<string, string> = {}
+          for (const [k, v] of Object.entries(currentHeaders)) {
+            const lower = k.toLowerCase().trim()
+            if (
+              lower !== 'authorization' &&
+              lower !== 'proxy-authorization' &&
+              lower !== 'cookie' &&
+              lower !== 'cookie2'
+            ) {
+              sanitizedHeaders[k] = v
+            }
+          }
+          currentHeaders = sanitizedHeaders
+        }
+
+        // Method and Body semantics for redirects (RFC 9110)
+        // 301 and 302: historically change POST to GET and drop request body
+        // 303 (See Other): MUST change method to GET (unless HEAD) and drop request body
+        // 307 and 308: MUST preserve original method and body intact
+        if (
+          upstreamResult.status === 303 ||
+          ((upstreamResult.status === 301 || upstreamResult.status === 302) && currentMethod === 'POST')
+        ) {
+          currentMethod = 'GET'
+          currentBody = undefined
+          for (const k of Object.keys(currentHeaders)) {
+            if (k.toLowerCase() === 'content-type' || k.toLowerCase() === 'content-length') {
+              delete currentHeaders[k]
+            }
+          }
+        }
+
+        currentUrl = nextUrl
+        continue // Loop to re-validate destination URL against SSRF policy!
       }
 
       // Return successful response without logging secrets
@@ -376,21 +525,30 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   })
 })
 
-const server = app.listen(PORT, () => {
-  console.log(`API QuickTest Proxy server running on port ${PORT}`)
-})
+let server: http.Server | null = null
+
+if (process.env.NODE_ENV !== 'test') {
+  server = app.listen(PORT, () => {
+    console.log(`API QuickTest Proxy server running on port ${PORT}`)
+  })
+}
 
 // Graceful shutdown
 const shutdown = () => {
   console.log('Shutting down API QuickTest Proxy gracefully...')
   rateLimiter.destroy()
-  server.close(() => {
-    console.log('Proxy server closed.')
+  if (server) {
+    server.close(() => {
+      console.log('Proxy server closed.')
+      process.exit(0)
+    })
+  } else {
     process.exit(0)
-  })
+  }
 }
 
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 
+export { app, server, rateLimiter }
 export default app

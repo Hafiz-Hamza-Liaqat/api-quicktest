@@ -1,7 +1,11 @@
 import type { CollectionItem, EnvironmentProfile, HistoryItem, RequestModel } from '../types'
-import { sanitizeCollectionsForExport, sanitizeRequestForHistory } from './redact'
+import {
+  sanitizeCollections,
+  sanitizeEnvironmentProfile,
+  sanitizeRequestForHistory,
+} from './redact'
 
-const STORAGE_KEYS = {
+export const STORAGE_KEYS = {
   HISTORY: 'api_quicktest_v1_history',
   COLLECTIONS: 'api_quicktest_v1_collections',
   ENVIRONMENTS: 'api_quicktest_v1_environments',
@@ -157,8 +161,12 @@ export function loadCollections(): CollectionItem[] {
   }
 }
 
-export function saveCollections(collections: CollectionItem[]): void {
-  safeSetItem(STORAGE_KEYS.COLLECTIONS, JSON.stringify(collections))
+export function saveCollections(
+  collections: CollectionItem[],
+  options?: { allowSecrets?: boolean }
+): void {
+  const dataToStore = options?.allowSecrets ? collections : sanitizeCollections(collections)
+  safeSetItem(STORAGE_KEYS.COLLECTIONS, JSON.stringify(dataToStore))
 }
 
 export function loadEnvironments(): EnvironmentProfile[] {
@@ -172,8 +180,14 @@ export function loadEnvironments(): EnvironmentProfile[] {
   }
 }
 
-export function saveEnvironments(environments: EnvironmentProfile[]): void {
-  safeSetItem(STORAGE_KEYS.ENVIRONMENTS, JSON.stringify(environments))
+export function saveEnvironments(
+  environments: EnvironmentProfile[],
+  options?: { allowSecrets?: boolean }
+): void {
+  const dataToStore = options?.allowSecrets
+    ? environments
+    : environments.map((e) => sanitizeEnvironmentProfile(e))
+  safeSetItem(STORAGE_KEYS.ENVIRONMENTS, JSON.stringify(dataToStore))
 }
 
 export function loadActiveEnvId(): string {
@@ -193,8 +207,11 @@ export function saveTheme(theme: 'dark' | 'light'): void {
   safeSetItem(STORAGE_KEYS.THEME, theme)
 }
 
-export function exportCollectionsJson(collections: CollectionItem[]): string {
-  const sanitized = sanitizeCollectionsForExport(collections)
+export function exportCollectionsJson(
+  collections: CollectionItem[],
+  options?: { allowSecrets?: boolean }
+): string {
+  const sanitized = options?.allowSecrets ? collections : sanitizeCollections(collections)
   return JSON.stringify(
     {
       format: 'api-quicktest-collections',
@@ -208,7 +225,8 @@ export function exportCollectionsJson(collections: CollectionItem[]): string {
 }
 
 export function validateAndImportCollections(
-  jsonText: string
+  jsonText: string,
+  options?: { allowSecrets?: boolean }
 ): { success: boolean; collections?: CollectionItem[]; error?: string } {
   try {
     const data = JSON.parse(jsonText)
@@ -269,7 +287,8 @@ export function validateAndImportCollections(
       return { success: false, error: 'No valid collections found in the file.' }
     }
 
-    return { success: true, collections: validated }
+    const finalCollections = options?.allowSecrets ? validated : sanitizeCollections(validated)
+    return { success: true, collections: finalCollections }
   } catch (err: any) {
     return { success: false, error: `Invalid JSON syntax: ${err.message}` }
   }

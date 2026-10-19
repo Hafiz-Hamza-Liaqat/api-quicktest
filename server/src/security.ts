@@ -2,111 +2,59 @@ import dns from 'dns/promises'
 import net from 'net'
 import http from 'http'
 import https from 'https'
+import ipaddr from 'ipaddr.js'
 
 /**
- * Converts an IPv4 dotted string to a 32-bit unsigned number.
- */
-export function ipv4ToNumber(ip: string): number {
-  const parts = ip.split('.').map(Number)
-  if (parts.length !== 4 || parts.some((p) => isNaN(p) || p < 0 || p > 255)) {
-    throw new Error(`Invalid IPv4 address: ${ip}`)
-  }
-  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
-}
-
-/**
- * Checks if a 32-bit IPv4 address falls within a given CIDR block.
- */
-function inIpv4Range(ipNum: number, baseIpStr: string, maskBits: number): boolean {
-  const baseNum = ipv4ToNumber(baseIpStr)
-  const mask = maskBits === 0 ? 0 : (~0 << (32 - maskBits)) >>> 0
-  return (ipNum & mask) === (baseNum & mask)
-}
-
-/**
- * Checks if an IPv4 address is private, loopback, link-local, reserved, or multicast.
+ * Checks if an IPv4 address is private, loopback, link-local, carrier-grade NAT, reserved, or multicast.
  */
 export function isPrivateOrReservedIpv4(ip: string): boolean {
+  if (!ip || typeof ip !== 'string') return true
+  const trimmed = ip.trim()
+  if (!ipaddr.IPv4.isValid(trimmed)) {
+    return true
+  }
   try {
-    const num = ipv4ToNumber(ip)
-
-    // 0.0.0.0/8 Current network
-    if (inIpv4Range(num, '0.0.0.0', 8)) return true
-    // 10.0.0.0/8 Private network
-    if (inIpv4Range(num, '10.0.0.0', 8)) return true
-    // 127.0.0.0/8 Loopback
-    if (inIpv4Range(num, '127.0.0.0', 8)) return true
-    // 169.254.0.0/16 Link-local (Cloud metadata e.g. 169.254.169.254)
-    if (inIpv4Range(num, '169.254.0.0', 16)) return true
-    // 172.16.0.0/12 Private network
-    if (inIpv4Range(num, '172.16.0.0', 12)) return true
-    // 192.168.0.0/16 Private network
-    if (inIpv4Range(num, '192.168.0.0', 16)) return true
-    // 192.0.0.0/24 IETF Protocol Assignments
-    if (inIpv4Range(num, '192.0.0.0', 24)) return true
-    // 192.0.2.0/24 Documentation (TEST-NET-1)
-    if (inIpv4Range(num, '192.0.2.0', 24)) return true
-    // 198.51.100.0/24 Documentation (TEST-NET-2)
-    if (inIpv4Range(num, '198.51.100.0', 24)) return true
-    // 203.0.113.0/24 Documentation (TEST-NET-3)
-    if (inIpv4Range(num, '203.0.113.0', 24)) return true
-    // 224.0.0.0/4 Multicast
-    if (inIpv4Range(num, '224.0.0.0', 4)) return true
-    // 240.0.0.0/4 Reserved
-    if (inIpv4Range(num, '240.0.0.0', 4)) return true
-    // 255.255.255.255 Broadcast
-    if (num === 0xffffffff) return true
-
-    return false
+    const addr = ipaddr.IPv4.parse(trimmed)
+    return addr.range() !== 'unicast'
   } catch {
     return true
   }
 }
 
 /**
- * Checks if an IPv6 address is private, loopback, link-local, unique-local, or multicast.
+ * Checks if an IPv6 address is private, loopback, link-local, unique-local, multicast,
+ * or an IPv4-mapped IPv6 address pointing to a non-public IPv4.
  */
 export function isPrivateOrReservedIpv6(ip: string): boolean {
-  const norm = ip.toLowerCase().trim()
-
-  // Loopback and unspecified
-  if (norm === '::' || norm === '::1') return true
-
-  // IPv4-mapped IPv6, e.g. ::ffff:127.0.0.1 or ::ffff:7f00:1
-  if (norm.startsWith('::ffff:')) {
-    const remainder = norm.slice(7)
-    if (net.isIPv4(remainder)) {
-      return isPrivateOrReservedIpv4(remainder)
-    }
+  if (!ip || typeof ip !== 'string') return true
+  const trimmed = ip.trim()
+  if (!ipaddr.IPv6.isValid(trimmed)) {
+    return true
   }
-
-  // Unique local addresses (fc00::/7) - starts with fc or fd
-  if (/^f[cd][0-9a-f]{2}:/i.test(norm)) return true
-
-  // Link-local addresses (fe80::/10) - starts with fe8, fe9, fea, feb
-  if (/^fe[89ab][0-9a-f]:/i.test(norm)) return true
-
-  // Multicast (ff00::/8)
-  if (/^ff[0-9a-f]{2}:/i.test(norm)) return true
-
-  // Discard prefix (100::/64)
-  if (norm.startsWith('100:')) return true
-
-  return false
+  try {
+    const processed = ipaddr.process(trimmed)
+    return processed.range() !== 'unicast'
+  } catch {
+    return true
+  }
 }
 
 /**
- * Validates any IP address (IPv4 or IPv6)
+ * Validates any IP address (IPv4 or IPv6) against private, loopback, link-local, CGNAT,
+ * documentation, and reserved ranges using RFC-compliant ipaddr.js processing.
  */
 export function isPrivateOrReservedIp(ip: string): boolean {
-  const ipType = net.isIP(ip)
-  if (ipType === 4) {
-    return isPrivateOrReservedIpv4(ip)
+  if (!ip || typeof ip !== 'string') return true
+  const trimmed = ip.trim()
+  if (!ipaddr.isValid(trimmed)) {
+    return true // Unparseable or invalid IP is strictly rejected as unsafe
   }
-  if (ipType === 6) {
-    return isPrivateOrReservedIpv6(ip)
+  try {
+    const processed = ipaddr.process(trimmed)
+    return processed.range() !== 'unicast'
+  } catch {
+    return true
   }
-  return true // Not a valid IP -> consider unsafe
 }
 
 export interface DestinationValidationResult {
@@ -226,27 +174,47 @@ export async function validateDestinationUrl(
 }
 
 /**
+ * Resolves a hostname directly to a pinned IP for custom Agent lookup,
+ * preventing DNS rebinding attacks.
+ */
+export function pinnedLookup(
+  pinnedIp: string,
+  _hostname: string,
+  optionsOrCallback: any,
+  maybeCallback?: (err: NodeJS.ErrnoException | null, address: any, family?: number) => void
+): void {
+  const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback
+  const family = net.isIP(pinnedIp)
+  if (!cb) return
+
+  if (optionsOrCallback && typeof optionsOrCallback === 'object' && optionsOrCallback.all) {
+    cb(null, [{ address: pinnedIp, family }])
+  } else {
+    cb(null, pinnedIp, family)
+  }
+}
+
+/**
  * Creates custom HTTP / HTTPS agents that pin DNS lookup to the validated IP,
  * preventing DNS Rebinding attacks while preserving SNI and Host header.
  */
 export function createPinnedAgent(pinnedIp: string, isHttps: boolean): http.Agent | https.Agent {
-  const customLookup: typeof dns.lookup = ((
-    _hostname: string,
-    _options: any,
-    callback: (err: NodeJS.ErrnoException | null, address: string, family: number) => void
+  const customLookup = (
+    hostname: string,
+    optionsOrCallback: any,
+    maybeCallback?: (err: NodeJS.ErrnoException | null, address: any, family?: number) => void
   ) => {
-    const family = net.isIP(pinnedIp)
-    callback(null, pinnedIp, family)
-  }) as any
+    pinnedLookup(pinnedIp, hostname, optionsOrCallback, maybeCallback)
+  }
 
   if (isHttps) {
     return new https.Agent({
-      lookup: customLookup,
+      lookup: customLookup as any,
       keepAlive: false,
     })
   } else {
     return new http.Agent({
-      lookup: customLookup,
+      lookup: customLookup as any,
       keepAlive: false,
     })
   }
