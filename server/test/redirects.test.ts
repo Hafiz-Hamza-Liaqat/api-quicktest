@@ -93,6 +93,17 @@ describe('Proxy Redirects and Security Integration Tests', () => {
         return
       }
 
+      if (url.pathname === '/delay') {
+        const timer = setTimeout(() => {
+          if (!res.writableEnded) {
+            res.writeHead(200, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ delayed: true }))
+          }
+        }, 1800)
+        req.on('close', () => clearTimeout(timer))
+        return
+      }
+
       res.writeHead(404)
       res.end('Not found')
     })
@@ -391,7 +402,7 @@ describe('Proxy Redirects and Security Integration Tests', () => {
     expect(healthJson.status).toBe('ok')
   })
 
-  it('propagates client cancellation to upstream request and keeps proxy healthy', async () => {
+  it('propagates client cancellation, settles active operation exactly once, and processes subsequent requests normally', async () => {
     const controller = new AbortController()
 
     // Send request to slow streaming endpoint
@@ -413,15 +424,78 @@ describe('Proxy Redirects and Security Integration Tests', () => {
 
     await expect(proxyPromise).rejects.toThrow()
 
-    // Wait for cleanup
+    // Wait for stream cleanup and settlement
     await new Promise((resolve) => setTimeout(resolve, 250))
 
-    // Verify slow stream connection was terminated and cleaned up
+    // Verify slow stream connection was terminated and active count is 0
     const countRes = await fetch(`${proxyBaseUrl}/api/test/slow-stream/active-count`)
     const countJson = await countRes.json()
     expect(countJson.activeCount).toBe(0)
 
-    // Verify proxy server remains completely healthy
+    // Verify proxy server processes subsequent requests normally without hanging or duplicate responses
+    const nextReq = await fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${targetOriginB}/echo`,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ test: 'after_cancellation' }),
+      }),
+    })
+    expect(nextReq.status).toBe(200)
+    const nextJson = await nextReq.json()
+    expect(nextJson.status).toBe(200)
+    const bodyParsed = JSON.parse(nextJson.body)
+    expect(bodyParsed.receivedBody).toContain('after_cancellation')
+
+    // Verify health check succeeds
+    const health = await fetch(`${proxyBaseUrl}/health`)
+    expect(health.status).toBe(200)
+    const healthJson = await health.json()
+    expect(healthJson.status).toBe('ok')
+  })
+
+  it('handles upstream timeout cleanly and settles with 504 GATEWAY_TIMEOUT', async () => {
+    const res = await fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${targetOriginB}/delay`,
+        method: 'GET',
+        timeoutMs: 1000,
+      }),
+    })
+
+    expect(res.status).toBe(504)
+    const json = await res.json()
+    expect(json.code).toBe('GATEWAY_TIMEOUT')
+    expect(json.error).toContain('timed out')
+
+    // Verify proxy remains healthy after timeout
+    const health = await fetch(`${proxyBaseUrl}/health`)
+    expect(health.status).toBe(200)
+    const healthJson = await health.json()
+    expect(healthJson.status).toBe('ok')
+  })
+
+  it('settles cleanly when client disconnects before upstream request starts', async () => {
+    const controller = new AbortController()
+    controller.abort() // Pre-aborted
+
+    const proxyPromise = fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${targetOriginB}/echo`,
+        method: 'GET',
+      }),
+      signal: controller.signal,
+    })
+
+    await expect(proxyPromise).rejects.toThrow()
+
+    // Proxy must remain healthy
     const health = await fetch(`${proxyBaseUrl}/health`)
     expect(health.status).toBe(200)
     const healthJson = await health.json()

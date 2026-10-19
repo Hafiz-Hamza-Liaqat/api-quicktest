@@ -254,19 +254,23 @@ app.get('/api/test/slow-stream', (req: Request, res: Response) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' })
   res.write('stream chunk 1\n')
 
+  let cleanedUp = false
+  const cleanUpStream = () => {
+    if (cleanedUp) return
+    cleanedUp = true
+    clearInterval(interval)
+    activeSlowStreamsCount = Math.max(0, activeSlowStreamsCount - 1)
+  }
+
   const interval = setInterval(() => {
     if (res.writableEnded || req.destroyed) {
-      clearInterval(interval)
-      activeSlowStreamsCount = Math.max(0, activeSlowStreamsCount - 1)
+      cleanUpStream()
       return
     }
     res.write('keep-alive chunk\n')
   }, 200)
 
-  req.on('close', () => {
-    clearInterval(interval)
-    activeSlowStreamsCount = Math.max(0, activeSlowStreamsCount - 1)
-  })
+  req.on('close', cleanUpStream)
 })
 
 app.get('/api/test/slow-stream/active-count', (_req: Request, res: Response) => {
@@ -332,15 +336,15 @@ app.post('/proxy', async (req: Request, res: Response) => {
     'user-agent',
   ])
 
-  // Track client connection state for cancellation propagation
+  // Track client connection state and provide an explicit resolve-once cancellation settlement mechanism
   let clientDisconnected = false
-  let activeCleanup: (() => void) | null = null
+  let activeCancellationHandler: (() => void) | null = null
 
   const onClientClose = () => {
     if (!res.writableEnded) {
       clientDisconnected = true
-      if (activeCleanup) {
-        activeCleanup()
+      if (activeCancellationHandler) {
+        activeCancellationHandler()
       }
     }
   }
@@ -355,6 +359,9 @@ app.post('/proxy', async (req: Request, res: Response) => {
 
       // SSRF Validation for current target hop
       const validation = await validateDestinationUrl(currentUrl, allowLocalhostInDev)
+      if (clientDisconnected || res.writableEnded) {
+        return
+      }
       if (!validation.allowed || !validation.resolvedIp) {
         if (!clientDisconnected && !res.writableEnded) {
           res.status(403).json({
@@ -389,30 +396,7 @@ app.post('/proxy', async (req: Request, res: Response) => {
         const effectiveTimeout = Math.min(Math.max(timeoutMs, 1000), 60000)
         const upstreamStart = performance.now()
 
-        let activeReq: http.ClientRequest | null = null
-        let activeRes: http.IncomingMessage | null = null
-        let isOversized = false
-
-        const cleanupCurrent = () => {
-          if (activeRes) {
-            activeRes.removeAllListeners()
-            if (!activeRes.destroyed) {
-              activeRes.destroy()
-            }
-            activeRes = null
-          }
-          if (activeReq) {
-            activeReq.removeAllListeners()
-            if (!activeReq.destroyed) {
-              activeReq.destroy()
-            }
-            activeReq = null
-          }
-        }
-
-        activeCleanup = cleanupCurrent
-
-        const upstreamOutcome = await new Promise<
+        type UpstreamOutcome =
           | {
               kind: 'success'
               status: number
@@ -427,11 +411,67 @@ app.post('/proxy', async (req: Request, res: Response) => {
               code: string
               error: string
             }
-        >((resolve) => {
-          if (clientDisconnected) {
-            activeCleanup = null
-            resolve({
-              kind: 'error',
+          | {
+              kind: 'cancelled'
+              status: 499
+              code: 'CLIENT_CLOSED_REQUEST'
+              error: string
+            }
+
+        let activeReq: http.ClientRequest | null = null
+        let activeRes: http.IncomingMessage | null = null
+
+        const upstreamOutcome = await new Promise<UpstreamOutcome>((resolve) => {
+          let isSettled = false
+
+          const cleanupStreams = () => {
+            if (activeRes) {
+              activeRes.removeAllListeners('data')
+              activeRes.removeAllListeners('end')
+              activeRes.removeAllListeners('close')
+              // Keep error listener attached so destroying socket does not emit unhandled error
+              activeRes.removeAllListeners('error')
+              activeRes.on('error', () => {})
+              if (!activeRes.destroyed) {
+                activeRes.destroy()
+              }
+              activeRes = null
+            }
+
+            if (activeReq) {
+              activeReq.removeAllListeners('timeout')
+              activeReq.removeAllListeners('response')
+              // Keep error listener attached so destroying socket does not emit unhandled error
+              activeReq.removeAllListeners('error')
+              activeReq.on('error', () => {})
+              if (!activeReq.destroyed) {
+                activeReq.destroy()
+              }
+              activeReq = null
+            }
+          }
+
+          const settleOnce = (outcome: UpstreamOutcome) => {
+            if (isSettled) return
+            isSettled = true
+            activeCancellationHandler = null
+            cleanupStreams()
+            resolve(outcome)
+          }
+
+          // Register cancellation hook for this active in-flight operation
+          activeCancellationHandler = () => {
+            settleOnce({
+              kind: 'cancelled',
+              status: 499,
+              code: 'CLIENT_CLOSED_REQUEST',
+              error: 'Client disconnected or aborted request.',
+            })
+          }
+
+          if (clientDisconnected || res.writableEnded) {
+            settleOnce({
+              kind: 'cancelled',
               status: 499,
               code: 'CLIENT_CLOSED_REQUEST',
               error: 'Client closed request before upstream execution started.',
@@ -456,9 +496,7 @@ app.post('/proxy', async (req: Request, res: Response) => {
           activeReq = upstreamReq
 
           upstreamReq.on('timeout', () => {
-            cleanupCurrent()
-            activeCleanup = null
-            resolve({
+            settleOnce({
               kind: 'error',
               status: 504,
               code: 'GATEWAY_TIMEOUT',
@@ -467,10 +505,7 @@ app.post('/proxy', async (req: Request, res: Response) => {
           })
 
           upstreamReq.on('error', (err) => {
-            if (clientDisconnected || isOversized) return
-            cleanupCurrent()
-            activeCleanup = null
-            resolve({
+            settleOnce({
               kind: 'error',
               status: 502,
               code: 'UPSTREAM_FAILURE',
@@ -479,13 +514,15 @@ app.post('/proxy', async (req: Request, res: Response) => {
           })
 
           upstreamReq.on('response', (upstreamRes) => {
+            if (isSettled) {
+              upstreamRes.on('error', () => {})
+              upstreamRes.destroy()
+              return
+            }
             activeRes = upstreamRes
 
             upstreamRes.on('error', (err) => {
-              if (clientDisconnected || isOversized) return
-              cleanupCurrent()
-              activeCleanup = null
-              resolve({
+              settleOnce({
                 kind: 'error',
                 status: 502,
                 code: 'UPSTREAM_STREAM_ERROR',
@@ -510,13 +547,10 @@ app.post('/proxy', async (req: Request, res: Response) => {
             upstreamRes.setEncoding('utf8')
 
             upstreamRes.on('data', (chunk) => {
-              if (clientDisconnected || isOversized) return
+              if (isSettled) return
               totalBytes += Buffer.byteLength(chunk)
               if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
-                isOversized = true
-                cleanupCurrent()
-                activeCleanup = null
-                resolve({
+                settleOnce({
                   kind: 'error',
                   status: 502,
                   code: 'RESPONSE_TOO_LARGE',
@@ -528,10 +562,8 @@ app.post('/proxy', async (req: Request, res: Response) => {
             })
 
             upstreamRes.on('end', () => {
-              if (clientDisconnected || isOversized) return
-              cleanupCurrent()
-              activeCleanup = null
-              resolve({
+              if (isSettled) return
+              settleOnce({
                 kind: 'success',
                 status: upstreamRes.statusCode || 200,
                 statusText: upstreamRes.statusMessage || 'OK',
@@ -550,7 +582,7 @@ app.post('/proxy', async (req: Request, res: Response) => {
           upstreamReq.end()
         })
 
-        if (clientDisconnected || res.writableEnded) {
+        if (clientDisconnected || res.writableEnded || upstreamOutcome.kind === 'cancelled') {
           return
         }
 

@@ -187,7 +187,7 @@ npm run dev:server
 API QuickTest includes automated test coverage across unit, component, security, and browser E2E workflows:
 
 ```bash
-# Run Vitest unit & integration tests (72 tests across 10 suites)
+# Run Vitest unit & integration tests (79 tests across 10 suites)
 npm test
 
 # Run Playwright E2E browser tests (14 core workflows)
@@ -211,6 +211,7 @@ API QuickTest v1.0 implements defense-in-depth architectural security controls a
    - `saveCollections()` and `saveEnvironments()` automatically sanitize credentials before writing to browser `localStorage` or generating JSON export files.
    - Sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, API keys), bearer tokens, basic-auth passwords, secret environment variables, sensitive query parameters (`?token=`, `?apiKey=`, `?secret=`), and sensitive JSON body fields (`password`, `client_secret`, `token`) are stripped by default.
    - Raw-text request bodies (`body.type === 'raw'`) are cleared in persisted copies by default to prevent accidental credential leakage in unstructured payloads, while keeping active editor sessions completely unaffected.
+   - **Request History Privacy & Legacy Normalization**: `addHistoryItem()` and `saveHistory()` sanitize top-level request URLs (e.g. `?token=`, `?api_key=`, embedded userinfo) as well as `requestConfig` before persistence. `loadHistory()` automatically normalizes and cleans legacy history entries upon loading and safely persists the cleaned history back to `localStorage`, keeping history bounded to 50 items while preserving non-sensitive query parameters and history execution metadata.
    - Collection file imports are verified and sanitized upon ingestion to protect against untrusted shared files.
 
 2. **Cross-Origin Redirect & Credential Leakage Prevention**:
@@ -236,9 +237,10 @@ API QuickTest v1.0 implements defense-in-depth architectural security controls a
    - In Proxy Mode, response chunks are counted; if the upstream response exceeds 5 MB, the upstream stream is destroyed cleanly with proper error/close lifecycle management, returning a controlled HTTP 502 `RESPONSE_TOO_LARGE` without process crashes or unhandled stream rejections.
    - Upstream timers and listeners are deterministically cleaned up on both success and failure.
 
-6. **Client Cancellation & Abort Propagation**:
-   - When a client aborts or closes the connection to `/proxy` mid-flight, the active upstream request is destroyed immediately and no writes are attempted to closed sockets.
-   - Resources, listeners, and streaming agents are freed cleanly, preserving proxy stability for subsequent requests.
+6. **Client Cancellation & Settle-Once Mechanism**:
+   - When a client aborts or closes the connection to `/proxy` mid-flight, an explicit resolve-once cancellation settlement mechanism cleanly settles the active async operation with a typed `CLIENT_CLOSED_REQUEST` outcome.
+   - Upstream request and response streams are destroyed safely with persistent error handlers preventing uncaught socket exceptions.
+   - Timers and stream listeners are cleaned up deterministically, late events cannot settle a second time, and no response is attempted to disconnected sockets, preserving proxy health for subsequent requests.
 
 7. **Remote Deployment Guard**:
    - When hosted on GitHub Pages or remote static hosts without a configured `VITE_API_PROXY_URL`, the client displays a clear unconfigured notice rather than silently failing to connect to `localhost:3001`.

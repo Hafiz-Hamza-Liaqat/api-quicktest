@@ -2,6 +2,7 @@ import type {
   AuthConfig,
   CollectionItem,
   EnvironmentProfile,
+  HistoryItem,
   KeyValuePair,
   RequestBodyConfig,
   RequestModel,
@@ -35,12 +36,15 @@ export function isSensitiveQueryParam(key: string): boolean {
   return (
     lower === 'api_key' ||
     lower === 'apikey' ||
+    lower === 'api-key' ||
     lower === 'key' ||
     lower === 'token' ||
     lower === 'access_token' ||
+    lower === 'access-token' ||
     lower === 'auth' ||
     lower === 'secret' ||
     lower === 'client_secret' ||
+    lower === 'client-secret' ||
     lower === 'password' ||
     lower === 'pass' ||
     lower === 'pwd'
@@ -68,7 +72,7 @@ export function sanitizeAuthConfig(auth: AuthConfig): AuthConfig {
  * Redacts credential values from query parameters.
  */
 export function sanitizeQueryParams(params: KeyValuePair[]): KeyValuePair[] {
-  return params.map((p) => {
+  return (params || []).map((p) => {
     if (isSensitiveQueryParam(p.key)) {
       return { ...p, value: '' }
     }
@@ -77,14 +81,17 @@ export function sanitizeQueryParams(params: KeyValuePair[]): KeyValuePair[] {
 }
 
 /**
- * Redacts credentials from embedded query strings in URL strings (e.g. ?token=secret).
+ * Redacts credentials from embedded userinfo and query strings in URL strings (e.g. ?token=secret).
  */
 export function sanitizeUrlCredentials(url: string): string {
   if (!url) return ''
-  return url.replace(
-    /([?&](?:api_key|apikey|key|token|access_token|auth|secret|client_secret|password|pwd|pass)=)[^&#]*/gi,
+  // Strip userinfo password if present (e.g. https://user:pass@host -> https://user@host)
+  let cleaned = url.replace(/:\/\/([^@/?#\s]*):([^@/?#\s]+)@/g, '://$1@')
+  cleaned = cleaned.replace(
+    /([?&](?:api_key|apikey|api-key|key|token|access_token|access-token|auth|secret|client_secret|client-secret|password|pwd|pass)=)[^&#]*/gi,
     '$1'
   )
+  return cleaned
 }
 
 /**
@@ -165,16 +172,19 @@ export function sanitizeRequestModel(
   req: RequestModel,
   options?: { allowSecrets?: boolean }
 ): RequestModel {
+  if (!req || typeof req !== 'object') {
+    return req
+  }
   if (options?.allowSecrets) {
     return { ...req }
   }
   return {
     ...req,
-    url: sanitizeUrlCredentials(req.url),
-    queryParams: sanitizeQueryParams(req.queryParams),
-    auth: sanitizeAuthConfig(req.auth),
-    headers: req.headers.map((h) => {
-      if (isSensitiveHeaderName(h.key)) {
+    url: sanitizeUrlCredentials(req.url || ''),
+    queryParams: sanitizeQueryParams(req.queryParams || []),
+    auth: sanitizeAuthConfig(req.auth || { type: 'none' }),
+    headers: (req.headers || []).map((h) => {
+      if (h && h.key && isSensitiveHeaderName(h.key)) {
         return { ...h, value: '' }
       }
       return { ...h }
@@ -189,7 +199,7 @@ export function sanitizeRequestModel(
 export function sanitizeEnvironmentProfile(profile: EnvironmentProfile): EnvironmentProfile {
   return {
     ...profile,
-    variables: profile.variables.map((v) => {
+    variables: (profile.variables || []).map((v) => {
       if (v.isSecret) {
         return { ...v, value: '' }
       }
@@ -208,9 +218,9 @@ export function sanitizeCollections(
   if (options?.allowSecrets) {
     return collections
   }
-  return collections.map((col) => ({
+  return (collections || []).map((col) => ({
     ...col,
-    requests: col.requests.map((r) => sanitizeRequestModel(r, options)),
+    requests: (col.requests || []).map((r) => sanitizeRequestModel(r, options)),
   }))
 }
 
@@ -226,4 +236,26 @@ export function sanitizeRequestForHistory(req: RequestModel): Omit<RequestModel,
   const sanitized = sanitizeRequestModel(req, { allowSecrets: false })
   const { id: _, ...rest } = sanitized
   return rest
+}
+
+/**
+ * Sanitizes a HistoryItem, ensuring top-level URL and requestConfig are clean of secrets.
+ */
+export function sanitizeHistoryItem(
+  item: HistoryItem,
+  options?: { allowSecrets?: boolean }
+): HistoryItem {
+  if (!item || typeof item !== 'object') {
+    return item
+  }
+  if (options?.allowSecrets) {
+    return { ...item }
+  }
+  return {
+    ...item,
+    url: sanitizeUrlCredentials(item.url || ''),
+    requestConfig: item.requestConfig
+      ? (sanitizeRequestForHistory(item.requestConfig as RequestModel) as Omit<RequestModel, 'id'>)
+      : item.requestConfig,
+  }
 }

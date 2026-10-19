@@ -1,13 +1,16 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import {
+  addHistoryItem,
   exportCollectionsJson,
+  loadHistory,
   saveCollections,
   saveEnvironments,
+  saveHistory,
   STORAGE_KEYS,
   validateAndImportCollections,
 } from '../utils/storage'
-import { sanitizeRequestModel, sanitizeAuthConfig } from '../utils/redact'
-import type { CollectionItem, EnvironmentProfile, RequestModel } from '../types'
+import { sanitizeRequestModel, sanitizeAuthConfig, sanitizeHistoryItem } from '../utils/redact'
+import type { CollectionItem, EnvironmentProfile, HistoryItem, RequestModel } from '../types'
 
 describe('Storage, Redaction, and Collection Import/Export', () => {
   beforeEach(() => {
@@ -313,6 +316,207 @@ describe('Storage, Redaction, and Collection Import/Export', () => {
     // Proves opt-in retains rawText when allowSecrets is true
     const explicitExport = exportCollectionsJson(collectionWithRawBody, { allowSecrets: true })
     expect(explicitExport).toContain('dummy_raw_password_999')
+  })
+
+  it('sanitizes URL and requestConfig when adding a history item with ?token= and ?api_key=', () => {
+    const liveRequest: RequestModel = {
+      id: 'req_live_1',
+      name: 'Search Users',
+      method: 'GET',
+      url: 'https://api.example.com/search?token=secret_token_123&api_key=key_abc_999&filter=active&page=1',
+      queryParams: [
+        { id: 'p1', key: 'token', value: 'secret_token_123', enabled: true },
+        { id: 'p2', key: 'api_key', value: 'key_abc_999', enabled: true },
+        { id: 'p3', key: 'filter', value: 'active', enabled: true },
+        { id: 'p4', key: 'page', value: '1', enabled: true },
+      ],
+      headers: [
+        { id: 'h1', key: 'Authorization', value: 'Bearer top_secret_jwt', enabled: true },
+        { id: 'h2', key: 'Accept', value: 'application/json', enabled: true },
+      ],
+      body: { type: 'none', rawText: '' },
+      auth: { type: 'bearer', bearerToken: 'top_secret_jwt' },
+      assertions: [],
+      timeoutMs: 30000,
+      requestMode: 'direct',
+    }
+
+    const history = addHistoryItem(liveRequest, 200, 150, false)
+
+    // Verify history entry top-level URL is sanitized
+    expect(history.length).toBe(1)
+    const entry = history[0]
+    expect(entry.url).not.toContain('secret_token_123')
+    expect(entry.url).not.toContain('key_abc_999')
+    expect(entry.url).toContain('filter=active')
+    expect(entry.url).toContain('page=1')
+    expect(entry.url).toBe('https://api.example.com/search?token=&api_key=&filter=active&page=1')
+
+    // Verify requestConfig is sanitized
+    expect(entry.requestConfig.url).toBe(
+      'https://api.example.com/search?token=&api_key=&filter=active&page=1'
+    )
+    expect(entry.requestConfig.auth.bearerToken).toBe('')
+    const authHeader = entry.requestConfig.headers.find((h) => h.key === 'Authorization')
+    expect(authHeader?.value).toBe('')
+    const acceptHeader = entry.requestConfig.headers.find((h) => h.key === 'Accept')
+    expect(acceptHeader?.value).toBe('application/json')
+
+    // Verify localStorage contains sanitized values
+    const stored = localStorage.getItem(STORAGE_KEYS.HISTORY)
+    expect(stored).toBeDefined()
+    expect(stored).not.toContain('secret_token_123')
+    expect(stored).not.toContain('key_abc_999')
+    expect(stored).not.toContain('top_secret_jwt')
+    expect(stored).toContain('filter=active')
+
+    // Prove live request in active editor is completely unaltered
+    expect(liveRequest.url).toBe(
+      'https://api.example.com/search?token=secret_token_123&api_key=key_abc_999&filter=active&page=1'
+    )
+    expect(liveRequest.auth.bearerToken).toBe('top_secret_jwt')
+    expect(liveRequest.headers[0].value).toBe('Bearer top_secret_jwt')
+  })
+
+  it('normalizes legacy history containing sensitive URLs when loadHistory is called and resaves cleaned data', () => {
+    // Inject legacy unsanitized history item into localStorage
+    const legacyHistory: HistoryItem[] = [
+      {
+        id: 'hist_legacy_1',
+        timestamp: 1670000000,
+        method: 'GET',
+        url: 'https://api.example.com/user?token=old_leaked_secret&api_key=old_key&limit=25',
+        status: 200,
+        durationMs: 85,
+        networkError: false,
+        requestConfig: {
+          name: 'Legacy Req',
+          method: 'GET',
+          url: 'https://api.example.com/user?token=old_leaked_secret&api_key=old_key&limit=25',
+          queryParams: [
+            { id: '1', key: 'token', value: 'old_leaked_secret', enabled: true },
+            { id: '2', key: 'limit', value: '25', enabled: true },
+          ],
+          headers: [{ id: 'h1', key: 'Authorization', value: 'Bearer legacy_token', enabled: true }],
+          body: { type: 'none', rawText: '' },
+          auth: { type: 'bearer', bearerToken: 'legacy_token' },
+          assertions: [],
+          timeoutMs: 30000,
+          requestMode: 'direct',
+        },
+      },
+    ]
+
+    localStorage.setItem(STORAGE_KEYS.HISTORY, JSON.stringify(legacyHistory))
+
+    // Call loadHistory - it should normalize credentials and resave
+    const loaded = loadHistory()
+
+    expect(loaded.length).toBe(1)
+    const normalized = loaded[0]
+
+    // Credentials must be stripped
+    expect(normalized.url).not.toContain('old_leaked_secret')
+    expect(normalized.url).not.toContain('old_key')
+    expect(normalized.url).toBe('https://api.example.com/user?token=&api_key=&limit=25')
+
+    // RequestConfig credentials must be stripped
+    expect(normalized.requestConfig.url).toBe(
+      'https://api.example.com/user?token=&api_key=&limit=25'
+    )
+    expect(normalized.requestConfig.auth.bearerToken).toBe('')
+    expect(normalized.requestConfig.headers[0].value).toBe('')
+
+    // Non-sensitive query parameters and history metadata must be preserved
+    expect(normalized.id).toBe('hist_legacy_1')
+    expect(normalized.timestamp).toBe(1670000000)
+    expect(normalized.method).toBe('GET')
+    expect(normalized.status).toBe(200)
+    expect(normalized.durationMs).toBe(85)
+    expect(normalized.networkError).toBe(false)
+    expect(normalized.url).toContain('limit=25')
+
+    // Verify localStorage was updated with the cleaned version
+    const updatedStored = localStorage.getItem(STORAGE_KEYS.HISTORY)
+    expect(updatedStored).not.toContain('old_leaked_secret')
+    expect(updatedStored).not.toContain('old_key')
+    expect(updatedStored).not.toContain('legacy_token')
+    expect(updatedStored).toContain('limit=25')
+  })
+
+  it('saveHistory sanitizes all incoming entries and bounds to 50 items', () => {
+    const dirtyItems: HistoryItem[] = Array.from({ length: 60 }, (_, i) => ({
+      id: `h_${i}`,
+      timestamp: Date.now() - i * 1000,
+      method: 'GET',
+      url: `https://api.example.com/resource?token=secret_${i}&page=${i}`,
+      status: 200,
+      durationMs: 50,
+      requestConfig: {
+        name: `Req ${i}`,
+        method: 'GET',
+        url: `https://api.example.com/resource?token=secret_${i}&page=${i}`,
+        queryParams: [],
+        headers: [{ id: '1', key: 'Authorization', value: `Bearer sec_${i}`, enabled: true }],
+        body: { type: 'none', rawText: '' },
+        auth: { type: 'bearer', bearerToken: `sec_${i}` },
+        assertions: [],
+        timeoutMs: 30000,
+        requestMode: 'direct',
+      },
+    }))
+
+    saveHistory(dirtyItems)
+
+    const storedRaw = localStorage.getItem(STORAGE_KEYS.HISTORY)
+    expect(storedRaw).toBeDefined()
+    const parsed: HistoryItem[] = JSON.parse(storedRaw!)
+
+    // Bounded to 50 items
+    expect(parsed.length).toBe(50)
+
+    // All items sanitized
+    for (const item of parsed) {
+      expect(item.url).not.toContain('secret_')
+      expect(item.url).toContain('token=&page=')
+      expect(item.requestConfig.auth.bearerToken).toBe('')
+      expect(item.requestConfig.headers[0].value).toBe('')
+    }
+  })
+
+  it('handles corrupted localStorage gracefully when loading history', () => {
+    localStorage.setItem(STORAGE_KEYS.HISTORY, '{"corrupted": true')
+    const loaded = loadHistory()
+    expect(loaded).toEqual([])
+  })
+
+  it('sanitizeHistoryItem sanitizes URL and requestConfig directly and supports opt-in', () => {
+    const item: HistoryItem = {
+      id: 'h_test',
+      timestamp: 1000,
+      method: 'GET',
+      url: 'https://api.example.com/test?token=my_secret_token',
+      requestConfig: {
+        name: 'Test',
+        method: 'GET',
+        url: 'https://api.example.com/test?token=my_secret_token',
+        queryParams: [],
+        headers: [{ id: '1', key: 'Authorization', value: 'Bearer secret', enabled: true }],
+        body: { type: 'none', rawText: '' },
+        auth: { type: 'bearer', bearerToken: 'secret' },
+        assertions: [],
+        timeoutMs: 30000,
+        requestMode: 'direct',
+      },
+    }
+
+    const sanitized = sanitizeHistoryItem(item)
+    expect(sanitized.url).toBe('https://api.example.com/test?token=')
+    expect(sanitized.requestConfig.auth.bearerToken).toBe('')
+
+    const allowed = sanitizeHistoryItem(item, { allowSecrets: true })
+    expect(allowed.url).toBe('https://api.example.com/test?token=my_secret_token')
+    expect(allowed.requestConfig.auth.bearerToken).toBe('secret')
   })
 })
 

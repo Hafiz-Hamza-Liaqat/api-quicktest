@@ -2,7 +2,9 @@ import type { CollectionItem, EnvironmentProfile, HistoryItem, RequestModel } fr
 import {
   sanitizeCollections,
   sanitizeEnvironmentProfile,
+  sanitizeHistoryItem,
   sanitizeRequestForHistory,
+  sanitizeUrlCredentials,
 } from './redact'
 
 export const STORAGE_KEYS = {
@@ -112,15 +114,42 @@ export function loadHistory(): HistoryItem[] {
     const raw = safeGetItem(STORAGE_KEYS.HISTORY)
     if (!raw) return []
     const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? parsed : []
+    if (!Array.isArray(parsed)) return []
+
+    let needsResave = false
+    const sanitized: HistoryItem[] = []
+
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object') continue
+      const cleaned = sanitizeHistoryItem(item)
+      if (
+        item.url !== cleaned.url ||
+        JSON.stringify(item.requestConfig) !== JSON.stringify(cleaned.requestConfig)
+      ) {
+        needsResave = true
+      }
+      sanitized.push(cleaned)
+    }
+
+    const bounded = sanitized.slice(0, 50)
+    if (needsResave || bounded.length !== parsed.length) {
+      try {
+        safeSetItem(STORAGE_KEYS.HISTORY, JSON.stringify(bounded))
+      } catch {
+        // Handle localStorage quota or disabled state gracefully
+      }
+    }
+    return bounded
   } catch {
     return []
   }
 }
 
 export function saveHistory(history: HistoryItem[]): void {
-  const bounded = history.slice(0, 50)
-  safeSetItem(STORAGE_KEYS.HISTORY, JSON.stringify(bounded))
+  const sanitized = Array.isArray(history)
+    ? history.map((item) => sanitizeHistoryItem(item)).slice(0, 50)
+    : []
+  safeSetItem(STORAGE_KEYS.HISTORY, JSON.stringify(sanitized))
 }
 
 export function addHistoryItem(
@@ -135,7 +164,7 @@ export function addHistoryItem(
     id: `hist_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
     timestamp: Date.now(),
     method: request.method,
-    url: request.url,
+    url: sanitizeUrlCredentials(request.url),
     status,
     durationMs,
     networkError,
