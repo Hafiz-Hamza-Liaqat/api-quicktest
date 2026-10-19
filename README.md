@@ -187,7 +187,7 @@ npm run dev:server
 API QuickTest includes automated test coverage across unit, component, security, and browser E2E workflows:
 
 ```bash
-# Run Vitest unit & integration tests (79 tests across 10 suites)
+# Run Vitest unit & integration tests (84 tests across 10 suites)
 npm test
 
 # Run Playwright E2E browser tests (14 core workflows)

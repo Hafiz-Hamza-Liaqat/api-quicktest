@@ -82,16 +82,21 @@ export function sanitizeQueryParams(params: KeyValuePair[]): KeyValuePair[] {
 
 /**
  * Redacts credentials from embedded userinfo and query strings in URL strings (e.g. ?token=secret).
+ * Removes entire userinfo section (both username and password) from URLs (e.g. https://user:pass@host -> https://host).
  */
 export function sanitizeUrlCredentials(url: string): string {
-  if (!url) return ''
-  // Strip userinfo password if present (e.g. https://user:pass@host -> https://user@host)
-  let cleaned = url.replace(/:\/\/([^@/?#\s]*):([^@/?#\s]+)@/g, '://$1@')
-  cleaned = cleaned.replace(
-    /([?&](?:api_key|apikey|api-key|key|token|access_token|access-token|auth|secret|client_secret|client-secret|password|pwd|pass)=)[^&#]*/gi,
-    '$1'
-  )
-  return cleaned
+  if (!url || typeof url !== 'string') return ''
+  try {
+    // Strip entire userinfo section (username and password) if present
+    let cleaned = url.replace(/(:\/\/|\/\/)[^/?#\s]*@/g, '$1')
+    cleaned = cleaned.replace(
+      /([?&](?:api_key|apikey|api-key|key|token|access_token|access-token|auth|secret|client_secret|client-secret|password|pwd|pass)=)[^&#]*/gi,
+      '$1'
+    )
+    return cleaned
+  } catch {
+    return url
+  }
 }
 
 /**

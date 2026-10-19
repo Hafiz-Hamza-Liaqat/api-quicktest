@@ -9,7 +9,12 @@ import {
   STORAGE_KEYS,
   validateAndImportCollections,
 } from '../utils/storage'
-import { sanitizeRequestModel, sanitizeAuthConfig, sanitizeHistoryItem } from '../utils/redact'
+import {
+  sanitizeRequestModel,
+  sanitizeAuthConfig,
+  sanitizeHistoryItem,
+  sanitizeUrlCredentials,
+} from '../utils/redact'
 import type { CollectionItem, EnvironmentProfile, HistoryItem, RequestModel } from '../types'
 
 describe('Storage, Redaction, and Collection Import/Export', () => {
@@ -517,6 +522,108 @@ describe('Storage, Redaction, and Collection Import/Export', () => {
     const allowed = sanitizeHistoryItem(item, { allowSecrets: true })
     expect(allowed.url).toBe('https://api.example.com/test?token=my_secret_token')
     expect(allowed.requestConfig.auth.bearerToken).toBe('secret')
+  })
+
+  describe('URL User-Info and Credential Sanitization', () => {
+    it('removes username and password user-info completely from URLs', () => {
+      expect(sanitizeUrlCredentials('https://username:password@example.com/api')).toBe(
+        'https://example.com/api'
+      )
+      expect(sanitizeUrlCredentials('http://admin:secret123@localhost:3000/v1/users')).toBe(
+        'http://localhost:3000/v1/users'
+      )
+      expect(sanitizeUrlCredentials('https://:onlypass@example.com/resource')).toBe(
+        'https://example.com/resource'
+      )
+      expect(sanitizeUrlCredentials('https://username:@example.com/resource')).toBe(
+        'https://example.com/resource'
+      )
+    })
+
+    it('removes username-only user-info completely from URLs', () => {
+      expect(sanitizeUrlCredentials('https://username@example.com/api')).toBe(
+        'https://example.com/api'
+      )
+      expect(sanitizeUrlCredentials('http://deployer@127.0.0.1:8080/deploy')).toBe(
+        'http://127.0.0.1:8080/deploy'
+      )
+      expect(sanitizeUrlCredentials('//user@cdn.example.com/assets')).toBe(
+        '//cdn.example.com/assets'
+      )
+    })
+
+    it('redacts sensitive query parameters while preserving ordinary parameters, hostname, path, and fragment', () => {
+      const complexUrl =
+        'https://username:password@example.com:8443/v1/search?token=secret_token&filter=active&api_key=key_xyz&page=3&access_token=jwt_val#results'
+
+      const sanitized = sanitizeUrlCredentials(complexUrl)
+
+      // User-info removed
+      expect(sanitized).not.toContain('username')
+      expect(sanitized).not.toContain('password')
+      expect(sanitized).not.toContain('@example.com')
+
+      // Hostname, port, path, and fragment preserved
+      expect(sanitized).toContain('https://example.com:8443/v1/search')
+      expect(sanitized).toContain('#results')
+
+      // Sensitive query parameters redacted
+      expect(sanitized).not.toContain('secret_token')
+      expect(sanitized).not.toContain('key_xyz')
+      expect(sanitized).not.toContain('jwt_val')
+      expect(sanitized).toContain('token=')
+      expect(sanitized).toContain('api_key=')
+      expect(sanitized).toContain('access_token=')
+
+      // Non-sensitive query parameters preserved
+      expect(sanitized).toContain('filter=active')
+      expect(sanitized).toContain('page=3')
+
+      // Email in query parameter or fragment with @ is not stripped as user-info
+      const emailUrl = 'https://example.com/api?email=user@example.com&role=admin'
+      expect(sanitizeUrlCredentials(emailUrl)).toBe(
+        'https://example.com/api?email=user@example.com&role=admin'
+      )
+    })
+
+    it('handles malformed URLs safely without throwing', () => {
+      expect(sanitizeUrlCredentials('')).toBe('')
+      expect(sanitizeUrlCredentials(null as any)).toBe('')
+      expect(sanitizeUrlCredentials(undefined as any)).toBe('')
+      expect(sanitizeUrlCredentials('not a valid url!@#$')).toBe('not a valid url!@#$')
+      expect(sanitizeUrlCredentials('{{baseUrl}}/api/test?token=abc')).toBe(
+        '{{baseUrl}}/api/test?token='
+      )
+    })
+
+    it('preserves the active request URL in editor when creating sanitized history items', () => {
+      const activeRequest: RequestModel = {
+        id: 'req_editor_1',
+        name: 'User Info Request',
+        method: 'GET',
+        url: 'https://operator:superSecret@internal.example.com/api?token=liveToken&limit=10',
+        queryParams: [],
+        headers: [],
+        body: { type: 'none', rawText: '' },
+        auth: { type: 'none' },
+        assertions: [],
+        timeoutMs: 30000,
+        requestMode: 'direct',
+      }
+
+      const history = addHistoryItem(activeRequest, 200, 50, false)
+
+      // Stored history item URL is sanitized (no user-info, sensitive query param stripped)
+      expect(history[0].url).toBe('https://internal.example.com/api?token=&limit=10')
+      expect(history[0].url).not.toContain('operator')
+      expect(history[0].url).not.toContain('superSecret')
+      expect(history[0].url).not.toContain('liveToken')
+
+      // Active request URL in editor remains untouched
+      expect(activeRequest.url).toBe(
+        'https://operator:superSecret@internal.example.com/api?token=liveToken&limit=10'
+      )
+    })
   })
 })
 
