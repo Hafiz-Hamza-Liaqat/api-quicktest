@@ -258,5 +258,61 @@ describe('Storage, Redaction, and Collection Import/Export', () => {
     const authH = importedReq.headers.find((h) => h.key === 'Authorization')
     expect(authH?.value).toBe('')
   })
+
+  it('omits raw-text bodies containing credentials from localStorage and exports by default', () => {
+    const rawSecretBody = 'grant_type=password&username=admin&password=dummy_raw_password_999&client_secret=raw_sec_key'
+    const collectionWithRawBody: CollectionItem[] = [
+      {
+        id: 'col_raw',
+        name: 'Raw Body Collection',
+        requests: [
+          {
+            id: 'r_raw_1',
+            name: 'Raw Auth Request',
+            method: 'POST',
+            url: 'https://api.example.com/oauth/token',
+            queryParams: [],
+            headers: [{ id: 'h1', key: 'Content-Type', value: 'application/x-www-form-urlencoded', enabled: true }],
+            body: {
+              type: 'raw',
+              rawText: rawSecretBody,
+            },
+            auth: { type: 'none' },
+            assertions: [],
+            timeoutMs: 30000,
+            requestMode: 'direct',
+          },
+        ],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+    ]
+
+    // Default save (allowSecrets false)
+    saveCollections(collectionWithRawBody)
+
+    const storedRaw = localStorage.getItem(STORAGE_KEYS.COLLECTIONS)
+    expect(storedRaw).toBeDefined()
+    expect(storedRaw).not.toContain('dummy_raw_password_999')
+    expect(storedRaw).not.toContain('raw_sec_key')
+
+    // Default export (allowSecrets false)
+    const exportedJson = exportCollectionsJson(collectionWithRawBody)
+    expect(exportedJson).not.toContain('dummy_raw_password_999')
+    expect(exportedJson).not.toContain('raw_sec_key')
+
+    // Proves import also omits raw-text bodies by default
+    const importPayload = JSON.stringify({
+      format: 'api-quicktest-collections',
+      collections: collectionWithRawBody,
+    })
+    const imported = validateAndImportCollections(importPayload)
+    expect(imported.success).toBe(true)
+    expect(imported.collections![0].requests[0].body.rawText).toBe('')
+
+    // Proves opt-in retains rawText when allowSecrets is true
+    const explicitExport = exportCollectionsJson(collectionWithRawBody, { allowSecrets: true })
+    expect(explicitExport).toContain('dummy_raw_password_999')
+  })
 })
 

@@ -89,10 +89,31 @@ export function sanitizeUrlCredentials(url: string): string {
 
 /**
  * Redacts common credential fields from request bodies.
+ * Raw-text request bodies are omitted/cleared in persisted copies by default to prevent secret leakage.
  */
-export function sanitizeRequestBody(body: RequestBodyConfig): RequestBodyConfig {
-  if (body.type !== 'json' || !body.rawText.trim()) {
+export function sanitizeRequestBody(
+  body: RequestBodyConfig,
+  options?: { allowSecrets?: boolean }
+): RequestBodyConfig {
+  if (!body) {
+    return { type: 'none', rawText: '' }
+  }
+
+  // If user explicitly opts-in to allow secrets, retain rawText
+  if (options?.allowSecrets) {
     return { ...body }
+  }
+
+  // Raw text mode: omit/clear raw-text bodies in persisted copies by default to prevent secret leakage
+  if (body.type === 'raw') {
+    return {
+      ...body,
+      rawText: '',
+    }
+  }
+
+  if (body.type !== 'json' || !body.rawText.trim()) {
+    return { ...body, rawText: '' }
   }
 
   try {
@@ -133,14 +154,20 @@ export function sanitizeRequestBody(body: RequestBodyConfig): RequestBodyConfig 
       rawText: JSON.stringify(redacted, null, 2),
     }
   } catch {
-    return { ...body }
+    return { ...body, rawText: '' }
   }
 }
 
 /**
  * Sanitizes a RequestModel by redacting secrets before saving to history, collections, or exports.
  */
-export function sanitizeRequestModel(req: RequestModel): RequestModel {
+export function sanitizeRequestModel(
+  req: RequestModel,
+  options?: { allowSecrets?: boolean }
+): RequestModel {
+  if (options?.allowSecrets) {
+    return { ...req }
+  }
   return {
     ...req,
     url: sanitizeUrlCredentials(req.url),
@@ -152,7 +179,7 @@ export function sanitizeRequestModel(req: RequestModel): RequestModel {
       }
       return { ...h }
     }),
-    body: sanitizeRequestBody(req.body),
+    body: sanitizeRequestBody(req.body, options),
   }
 }
 
@@ -174,10 +201,16 @@ export function sanitizeEnvironmentProfile(profile: EnvironmentProfile): Environ
 /**
  * Sanitizes an array of collections for export or storage.
  */
-export function sanitizeCollections(collections: CollectionItem[]): CollectionItem[] {
+export function sanitizeCollections(
+  collections: CollectionItem[],
+  options?: { allowSecrets?: boolean }
+): CollectionItem[] {
+  if (options?.allowSecrets) {
+    return collections
+  }
   return collections.map((col) => ({
     ...col,
-    requests: col.requests.map((r) => sanitizeRequestModel(r)),
+    requests: col.requests.map((r) => sanitizeRequestModel(r, options)),
   }))
 }
 
@@ -190,7 +223,7 @@ export const sanitizeCollectionsForExport = sanitizeCollections
  * Strips secrets from a request config when appending to History.
  */
 export function sanitizeRequestForHistory(req: RequestModel): Omit<RequestModel, 'id'> {
-  const sanitized = sanitizeRequestModel(req)
+  const sanitized = sanitizeRequestModel(req, { allowSecrets: false })
   const { id: _, ...rest } = sanitized
   return rest
 }

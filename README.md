@@ -187,7 +187,7 @@ npm run dev:server
 API QuickTest includes automated test coverage across unit, component, security, and browser E2E workflows:
 
 ```bash
-# Run Vitest unit & integration tests (66 tests across 10 suites)
+# Run Vitest unit & integration tests (72 tests across 10 suites)
 npm test
 
 # Run Playwright E2E browser tests (14 core workflows)
@@ -210,12 +210,13 @@ API QuickTest v1.0 implements defense-in-depth architectural security controls a
 1. **Zero-Secret Persistence by Default**:
    - `saveCollections()` and `saveEnvironments()` automatically sanitize credentials before writing to browser `localStorage` or generating JSON export files.
    - Sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, API keys), bearer tokens, basic-auth passwords, secret environment variables, sensitive query parameters (`?token=`, `?apiKey=`, `?secret=`), and sensitive JSON body fields (`password`, `client_secret`, `token`) are stripped by default.
+   - Raw-text request bodies (`body.type === 'raw'`) are cleared in persisted copies by default to prevent accidental credential leakage in unstructured payloads, while keeping active editor sessions completely unaffected.
    - Collection file imports are verified and sanitized upon ingestion to protect against untrusted shared files.
 
 2. **Cross-Origin Redirect & Credential Leakage Prevention**:
    - The `/proxy` redirect loop validates every hop against complete SSRF rules.
-   - Compares the redirect destination origin against the current origin. If cross-origin, any request containing authentication or sensitive headers is strictly rejected with HTTP 403 `CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED`.
-   - Non-sensitive cross-origin redirects strip residual auth headers before forwarding.
+   - Compares the redirect destination origin against the current origin. If cross-origin, any request containing authentication, sensitive headers, or custom headers outside the strict allowlist (`accept`, `accept-encoding`, `accept-language`, `user-agent`) is strictly rejected with HTTP 403 `CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED`.
+   - Headers such as `X-Session-Id`, `X-Client-Credential`, or `X-Internal-Key` cannot bypass heuristics and leak to a new origin.
    - RFC 9110 redirect semantics are enforced: 301 and 302 convert POST to GET (dropping the body), 303 converts to GET (dropping the body), and 307/308 strictly preserve the method and body.
    - Redirect loop detection (`REDIRECT_LOOP_DETECTED`) and hop limits (maximum 5 redirects) prevent infinite proxy looping.
 
@@ -230,12 +231,16 @@ API QuickTest v1.0 implements defense-in-depth architectural security controls a
    - Detects IPv4-mapped IPv6 in both dotted (`::ffff:127.0.0.1`) and hexadecimal (`::ffff:7f00:1`) notation.
    - DNS Agent Pinning (`createPinnedAgent`) pins upstream connections to the pre-validated IP address, mitigating Time-Of-Check to Time-Of-Use (TOCTOU) DNS Rebinding attacks.
 
-5. **Streaming Response Size Limits**:
-   - In Direct Mode, responses are read incrementally using `ReadableStream` reader chunk decoding.
-   - If the accumulated body exceeds `MAX_RESPONSE_BYTES` (5 MB), `reader.cancel()` immediately aborts upstream consumption to protect browser memory and network bandwidth.
-   - In Proxy Mode, response chunks are counted and truncated at 5 MB maximum.
+5. **Streaming Response Size Limits & Oversized Upstream Handling**:
+   - In Direct Mode, responses are read incrementally using `ReadableStream` reader chunk decoding, truncated at 5 MB maximum.
+   - In Proxy Mode, response chunks are counted; if the upstream response exceeds 5 MB, the upstream stream is destroyed cleanly with proper error/close lifecycle management, returning a controlled HTTP 502 `RESPONSE_TOO_LARGE` without process crashes or unhandled stream rejections.
+   - Upstream timers and listeners are deterministically cleaned up on both success and failure.
 
-6. **Remote Deployment Guard**:
+6. **Client Cancellation & Abort Propagation**:
+   - When a client aborts or closes the connection to `/proxy` mid-flight, the active upstream request is destroyed immediately and no writes are attempted to closed sockets.
+   - Resources, listeners, and streaming agents are freed cleanly, preserving proxy stability for subsequent requests.
+
+7. **Remote Deployment Guard**:
    - When hosted on GitHub Pages or remote static hosts without a configured `VITE_API_PROXY_URL`, the client displays a clear unconfigured notice rather than silently failing to connect to `localhost:3001`.
 
 ---

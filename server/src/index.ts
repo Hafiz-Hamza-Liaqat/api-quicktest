@@ -237,6 +237,42 @@ app.all('/api/test/redirect/status/:code', (req: Request, res: Response) => {
   res.redirect(code, '/api/test/echo')
 })
 
+// Endpoint for testing oversized response handling (>5MB)
+app.get('/api/test/oversized', (_req: Request, res: Response) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' })
+  const chunk = Buffer.alloc(1024 * 1024, 'X') // 1MB chunk
+  for (let i = 0; i < 6; i++) {
+    res.write(chunk)
+  }
+  res.end()
+})
+
+// Endpoints for testing client disconnection and upstream cancellation
+let activeSlowStreamsCount = 0
+app.get('/api/test/slow-stream', (req: Request, res: Response) => {
+  activeSlowStreamsCount++
+  res.writeHead(200, { 'Content-Type': 'text/plain' })
+  res.write('stream chunk 1\n')
+
+  const interval = setInterval(() => {
+    if (res.writableEnded || req.destroyed) {
+      clearInterval(interval)
+      activeSlowStreamsCount = Math.max(0, activeSlowStreamsCount - 1)
+      return
+    }
+    res.write('keep-alive chunk\n')
+  }, 200)
+
+  req.on('close', () => {
+    clearInterval(interval)
+    activeSlowStreamsCount = Math.max(0, activeSlowStreamsCount - 1)
+  })
+})
+
+app.get('/api/test/slow-stream/active-count', (_req: Request, res: Response) => {
+  res.status(200).json({ activeCount: activeSlowStreamsCount })
+})
+
 // -------------------------------------------------------------
 // 3. Secure Proxy Endpoint
 // -------------------------------------------------------------
@@ -288,231 +324,362 @@ app.post('/proxy', async (req: Request, res: Response) => {
   let redirectsCount = 0
   const visitedUrls = new Set<string>([url])
 
-  while (redirectsCount <= MAX_REDIRECTS) {
-    // SSRF Validation for current target hop
-    const validation = await validateDestinationUrl(currentUrl, allowLocalhostInDev)
-    if (!validation.allowed || !validation.resolvedIp) {
-      res.status(403).json({
-        error: validation.error || 'Destination target is not allowed by SSRF policy.',
-        code: 'SSRF_BLOCKED',
-      })
-      return
-    }
+  // Explicit allowlist of safe standard headers allowed to cross origins on redirects
+  const CROSS_ORIGIN_ALLOWED_HEADERS = new Set([
+    'accept',
+    'accept-encoding',
+    'accept-language',
+    'user-agent',
+  ])
 
-    try {
-      const parsedCurrentUrl = new URL(currentUrl)
-      const isHttps = parsedCurrentUrl.protocol === 'https:'
-      const agent = createPinnedAgent(validation.resolvedIp, isHttps)
+  // Track client connection state for cancellation propagation
+  let clientDisconnected = false
+  let activeCleanup: (() => void) | null = null
 
-      // Filter prohibited or hop-by-hop headers before forwarding
-      const forwardedHeaders: Record<string, string> = {}
-      for (const [k, v] of Object.entries(currentHeaders)) {
-        const lower = k.toLowerCase().trim()
-        if (
-          lower === 'host' ||
-          lower === 'content-length' ||
-          lower === 'connection' ||
-          lower === 'transfer-encoding'
-        ) {
-          continue
-        }
-        forwardedHeaders[k] = v
+  const onClientClose = () => {
+    if (!res.writableEnded) {
+      clientDisconnected = true
+      if (activeCleanup) {
+        activeCleanup()
       }
-      forwardedHeaders['Host'] = parsedCurrentUrl.host
+    }
+  }
 
-      const effectiveTimeout = Math.min(Math.max(timeoutMs, 1000), 60000)
-      const upstreamStart = performance.now()
+  res.once('close', onClientClose)
 
-      const upstreamResult = await new Promise<{
-        status: number
-        statusText: string
-        headers: Record<string, string>
-        body: string
-        location?: string
-      }>((resolve, reject) => {
-        const lib = isHttps ? https : http
+  try {
+    while (redirectsCount <= MAX_REDIRECTS) {
+      if (clientDisconnected || res.writableEnded) {
+        return
+      }
 
-        const reqOptions: http.RequestOptions = {
-          protocol: parsedCurrentUrl.protocol,
-          hostname: parsedCurrentUrl.hostname,
-          port: validation.port,
-          path: `${parsedCurrentUrl.pathname}${parsedCurrentUrl.search}`,
-          method: currentMethod,
-          headers: forwardedHeaders,
-          agent,
-          timeout: effectiveTimeout,
+      // SSRF Validation for current target hop
+      const validation = await validateDestinationUrl(currentUrl, allowLocalhostInDev)
+      if (!validation.allowed || !validation.resolvedIp) {
+        if (!clientDisconnected && !res.writableEnded) {
+          res.status(403).json({
+            error: validation.error || 'Destination target is not allowed by SSRF policy.',
+            code: 'SSRF_BLOCKED',
+          })
         }
+        return
+      }
 
-        const upstreamReq = lib.request(reqOptions, (upstreamRes) => {
-          const respHeaders: Record<string, string> = {}
-          for (const [hk, hv] of Object.entries(upstreamRes.headers)) {
-            if (hv !== undefined) {
-              respHeaders[hk] = Array.isArray(hv) ? hv.join(', ') : hv
-            }
+      try {
+        const parsedCurrentUrl = new URL(currentUrl)
+        const isHttps = parsedCurrentUrl.protocol === 'https:'
+        const agent = createPinnedAgent(validation.resolvedIp, isHttps)
+
+        // Filter prohibited or hop-by-hop headers before forwarding
+        const forwardedHeaders: Record<string, string> = {}
+        for (const [k, v] of Object.entries(currentHeaders)) {
+          const lower = k.toLowerCase().trim()
+          if (
+            lower === 'host' ||
+            lower === 'content-length' ||
+            lower === 'connection' ||
+            lower === 'transfer-encoding'
+          ) {
+            continue
           }
+          forwardedHeaders[k] = v
+        }
+        forwardedHeaders['Host'] = parsedCurrentUrl.host
 
-          let responseData = ''
-          let totalBytes = 0
+        const effectiveTimeout = Math.min(Math.max(timeoutMs, 1000), 60000)
+        const upstreamStart = performance.now()
 
-          upstreamRes.setEncoding('utf8')
+        let activeReq: http.ClientRequest | null = null
+        let activeRes: http.IncomingMessage | null = null
+        let isOversized = false
 
-          upstreamRes.on('data', (chunk) => {
-            totalBytes += Buffer.byteLength(chunk)
-            if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
-              upstreamRes.destroy(new Error('Response size limit exceeded (5MB maximum)'))
-              return
+        const cleanupCurrent = () => {
+          if (activeRes) {
+            activeRes.removeAllListeners()
+            if (!activeRes.destroyed) {
+              activeRes.destroy()
             }
-            responseData += chunk
-          })
+            activeRes = null
+          }
+          if (activeReq) {
+            activeReq.removeAllListeners()
+            if (!activeReq.destroyed) {
+              activeReq.destroy()
+            }
+            activeReq = null
+          }
+        }
 
-          upstreamRes.on('end', () => {
+        activeCleanup = cleanupCurrent
+
+        const upstreamOutcome = await new Promise<
+          | {
+              kind: 'success'
+              status: number
+              statusText: string
+              headers: Record<string, string>
+              body: string
+              location?: string
+            }
+          | {
+              kind: 'error'
+              status: number
+              code: string
+              error: string
+            }
+        >((resolve) => {
+          if (clientDisconnected) {
+            activeCleanup = null
             resolve({
-              status: upstreamRes.statusCode || 200,
-              statusText: upstreamRes.statusMessage || 'OK',
-              headers: respHeaders,
-              body: responseData,
-              location: respHeaders['location'],
-            })
-          })
-        })
-
-        upstreamReq.on('timeout', () => {
-          upstreamReq.destroy(new Error(`Upstream request timed out after ${effectiveTimeout}ms`))
-        })
-
-        upstreamReq.on('error', (err) => {
-          reject(err)
-        })
-
-        // Write body if applicable
-        if (currentMethod !== 'GET' && currentBody) {
-          upstreamReq.write(currentBody)
-        }
-
-        upstreamReq.end()
-      })
-
-      const upstreamDurationMs = Math.round(performance.now() - upstreamStart)
-
-      // Check for HTTP redirect status codes (301, 302, 303, 307, 308)
-      if (
-        [301, 302, 303, 307, 308].includes(upstreamResult.status) &&
-        upstreamResult.location
-      ) {
-        redirectsCount++
-        if (redirectsCount > MAX_REDIRECTS) {
-          res.status(502).json({
-            error: 'Maximum redirect limit exceeded (5 redirects max).',
-            code: 'TOO_MANY_REDIRECTS',
-          })
-          return
-        }
-
-        let nextUrl: string
-        try {
-          nextUrl = new URL(upstreamResult.location, currentUrl).toString()
-        } catch {
-          res.status(502).json({
-            error: `Malformed redirect location received from upstream: "${upstreamResult.location}".`,
-            code: 'INVALID_REDIRECT_LOCATION',
-          })
-          return
-        }
-
-        // Loop detection
-        if (visitedUrls.has(nextUrl)) {
-          res.status(502).json({
-            error: `Redirect loop detected: destination "${nextUrl}" was already visited.`,
-            code: 'REDIRECT_LOOP_DETECTED',
-          })
-          return
-        }
-        visitedUrls.add(nextUrl)
-
-        const currentOrigin = new URL(currentUrl).origin
-        const nextOrigin = new URL(nextUrl).origin
-        const isCrossOrigin = currentOrigin !== nextOrigin
-
-        if (isCrossOrigin) {
-          // Reject cross-origin redirects if credentials or secrets are present
-          const hasSensitiveCredentials = Object.keys(currentHeaders).some((k) => {
-            const lower = k.toLowerCase().trim()
-            return (
-              lower === 'authorization' ||
-              lower === 'proxy-authorization' ||
-              lower === 'cookie' ||
-              lower === 'cookie2' ||
-              lower === 'set-cookie' ||
-              lower.includes('token') ||
-              lower.includes('secret') ||
-              lower.includes('password') ||
-              lower.includes('apikey') ||
-              lower.includes('api-key') ||
-              lower.includes('api_key')
-            )
-          })
-
-          if (hasSensitiveCredentials) {
-            res.status(403).json({
-              error: `Cross-origin redirect rejected: Request contains sensitive credentials (Authorization / API Key / Cookie) that cannot be safely forwarded to a different origin ("${nextOrigin}").`,
-              code: 'CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED',
+              kind: 'error',
+              status: 499,
+              code: 'CLIENT_CLOSED_REQUEST',
+              error: 'Client closed request before upstream execution started.',
             })
             return
           }
 
-          // Strip any residual auth/cookie headers before redirecting across origins
-          const sanitizedHeaders: Record<string, string> = {}
-          for (const [k, v] of Object.entries(currentHeaders)) {
-            const lower = k.toLowerCase().trim()
-            if (
-              lower !== 'authorization' &&
-              lower !== 'proxy-authorization' &&
-              lower !== 'cookie' &&
-              lower !== 'cookie2'
-            ) {
-              sanitizedHeaders[k] = v
-            }
+          const lib = isHttps ? https : http
+
+          const reqOptions: http.RequestOptions = {
+            protocol: parsedCurrentUrl.protocol,
+            hostname: parsedCurrentUrl.hostname,
+            port: validation.port,
+            path: `${parsedCurrentUrl.pathname}${parsedCurrentUrl.search}`,
+            method: currentMethod,
+            headers: forwardedHeaders,
+            agent,
+            timeout: effectiveTimeout,
           }
-          currentHeaders = sanitizedHeaders
+
+          const upstreamReq = lib.request(reqOptions)
+          activeReq = upstreamReq
+
+          upstreamReq.on('timeout', () => {
+            cleanupCurrent()
+            activeCleanup = null
+            resolve({
+              kind: 'error',
+              status: 504,
+              code: 'GATEWAY_TIMEOUT',
+              error: `Upstream request timed out after ${effectiveTimeout}ms`,
+            })
+          })
+
+          upstreamReq.on('error', (err) => {
+            if (clientDisconnected || isOversized) return
+            cleanupCurrent()
+            activeCleanup = null
+            resolve({
+              kind: 'error',
+              status: 502,
+              code: 'UPSTREAM_FAILURE',
+              error: `Upstream request failed: ${err.message}`,
+            })
+          })
+
+          upstreamReq.on('response', (upstreamRes) => {
+            activeRes = upstreamRes
+
+            upstreamRes.on('error', (err) => {
+              if (clientDisconnected || isOversized) return
+              cleanupCurrent()
+              activeCleanup = null
+              resolve({
+                kind: 'error',
+                status: 502,
+                code: 'UPSTREAM_STREAM_ERROR',
+                error: `Upstream response stream error: ${err.message}`,
+              })
+            })
+
+            upstreamRes.on('close', () => {
+              // Upstream response closed
+            })
+
+            const respHeaders: Record<string, string> = {}
+            for (const [hk, hv] of Object.entries(upstreamRes.headers)) {
+              if (hv !== undefined) {
+                respHeaders[hk] = Array.isArray(hv) ? hv.join(', ') : hv
+              }
+            }
+
+            let responseData = ''
+            let totalBytes = 0
+
+            upstreamRes.setEncoding('utf8')
+
+            upstreamRes.on('data', (chunk) => {
+              if (clientDisconnected || isOversized) return
+              totalBytes += Buffer.byteLength(chunk)
+              if (totalBytes > MAX_RESPONSE_BODY_BYTES) {
+                isOversized = true
+                cleanupCurrent()
+                activeCleanup = null
+                resolve({
+                  kind: 'error',
+                  status: 502,
+                  code: 'RESPONSE_TOO_LARGE',
+                  error: 'Upstream response size limit exceeded (5MB maximum).',
+                })
+              } else {
+                responseData += chunk
+              }
+            })
+
+            upstreamRes.on('end', () => {
+              if (clientDisconnected || isOversized) return
+              cleanupCurrent()
+              activeCleanup = null
+              resolve({
+                kind: 'success',
+                status: upstreamRes.statusCode || 200,
+                statusText: upstreamRes.statusMessage || 'OK',
+                headers: respHeaders,
+                body: responseData,
+                location: respHeaders['location'],
+              })
+            })
+          })
+
+          // Write body if applicable
+          if (currentMethod !== 'GET' && currentBody) {
+            upstreamReq.write(currentBody)
+          }
+
+          upstreamReq.end()
+        })
+
+        if (clientDisconnected || res.writableEnded) {
+          return
         }
 
-        // Method and Body semantics for redirects (RFC 9110)
-        // 301 and 302: historically change POST to GET and drop request body
-        // 303 (See Other): MUST change method to GET (unless HEAD) and drop request body
-        // 307 and 308: MUST preserve original method and body intact
+        if (upstreamOutcome.kind === 'error') {
+          res.status(upstreamOutcome.status).json({
+            error: upstreamOutcome.error,
+            code: upstreamOutcome.code,
+          })
+          return
+        }
+
+        const upstreamResult = upstreamOutcome
+        const upstreamDurationMs = Math.round(performance.now() - upstreamStart)
+
+        // Check for HTTP redirect status codes (301, 302, 303, 307, 308)
         if (
-          upstreamResult.status === 303 ||
-          ((upstreamResult.status === 301 || upstreamResult.status === 302) && currentMethod === 'POST')
+          [301, 302, 303, 307, 308].includes(upstreamResult.status) &&
+          upstreamResult.location
         ) {
-          currentMethod = 'GET'
-          currentBody = undefined
-          for (const k of Object.keys(currentHeaders)) {
-            if (k.toLowerCase() === 'content-type' || k.toLowerCase() === 'content-length') {
-              delete currentHeaders[k]
+          redirectsCount++
+          if (redirectsCount > MAX_REDIRECTS) {
+            res.status(502).json({
+              error: 'Maximum redirect limit exceeded (5 redirects max).',
+              code: 'TOO_MANY_REDIRECTS',
+            })
+            return
+          }
+
+          let nextUrl: string
+          try {
+            nextUrl = new URL(upstreamResult.location, currentUrl).toString()
+          } catch {
+            res.status(502).json({
+              error: `Malformed redirect location received from upstream: "${upstreamResult.location}".`,
+              code: 'INVALID_REDIRECT_LOCATION',
+            })
+            return
+          }
+
+          // Loop detection
+          if (visitedUrls.has(nextUrl)) {
+            res.status(502).json({
+              error: `Redirect loop detected: destination "${nextUrl}" was already visited.`,
+              code: 'REDIRECT_LOOP_DETECTED',
+            })
+            return
+          }
+          visitedUrls.add(nextUrl)
+
+          const currentOrigin = new URL(currentUrl).origin
+          const nextOrigin = new URL(nextUrl).origin
+          const isCrossOrigin = currentOrigin !== nextOrigin
+
+          if (isCrossOrigin) {
+            // Check if any non-whitelisted header (custom header, session header, credential header) exists
+            const hasDisallowedCrossOriginHeader = Object.keys(currentHeaders).some((k) => {
+              const lower = k.toLowerCase().trim()
+              if (
+                lower === 'host' ||
+                lower === 'connection' ||
+                lower === 'content-length' ||
+                lower === 'transfer-encoding'
+              ) {
+                return false
+              }
+              return !CROSS_ORIGIN_ALLOWED_HEADERS.has(lower)
+            })
+
+            if (hasDisallowedCrossOriginHeader) {
+              res.status(403).json({
+                error: `Cross-origin redirect rejected: Request contains sensitive credentials or custom headers that cannot be safely forwarded to a different origin ("${nextOrigin}").`,
+                code: 'CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED',
+              })
+              return
+            }
+
+            // Forward strictly the safe allowlisted headers across origins
+            const sanitizedHeaders: Record<string, string> = {}
+            for (const [k, v] of Object.entries(currentHeaders)) {
+              const lower = k.toLowerCase().trim()
+              if (CROSS_ORIGIN_ALLOWED_HEADERS.has(lower)) {
+                sanitizedHeaders[k] = v
+              }
+            }
+            currentHeaders = sanitizedHeaders
+          }
+
+          // Method and Body semantics for redirects (RFC 9110)
+          // 301 and 302: change POST to GET and drop request body
+          // 303 (See Other): MUST change method to GET (unless HEAD) and drop request body
+          // 307 and 308: MUST preserve original method and body intact
+          if (
+            upstreamResult.status === 303 ||
+            ((upstreamResult.status === 301 || upstreamResult.status === 302) && currentMethod === 'POST')
+          ) {
+            currentMethod = 'GET'
+            currentBody = undefined
+            for (const k of Object.keys(currentHeaders)) {
+              if (k.toLowerCase() === 'content-type' || k.toLowerCase() === 'content-length') {
+                delete currentHeaders[k]
+              }
             }
           }
+
+          currentUrl = nextUrl
+          continue // Loop to re-validate destination URL against SSRF policy!
         }
 
-        currentUrl = nextUrl
-        continue // Loop to re-validate destination URL against SSRF policy!
+        // Return successful response without logging secrets
+        res.status(200).json({
+          status: upstreamResult.status,
+          statusText: upstreamResult.statusText,
+          headers: upstreamResult.headers,
+          body: upstreamResult.body,
+          upstreamDurationMs,
+        })
+        return
+      } catch (err: any) {
+        if (!clientDisconnected && !res.writableEnded) {
+          res.status(502).json({
+            error: `Upstream request failed: ${err.message}`,
+            code: 'UPSTREAM_FAILURE',
+          })
+        }
+        return
       }
-
-      // Return successful response without logging secrets
-      res.status(200).json({
-        status: upstreamResult.status,
-        statusText: upstreamResult.statusText,
-        headers: upstreamResult.headers,
-        body: upstreamResult.body,
-        upstreamDurationMs,
-      })
-      return
-    } catch (err: any) {
-      res.status(502).json({
-        error: `Upstream request failed: ${err.message}`,
-        code: 'UPSTREAM_FAILURE',
-      })
-      return
     }
+  } finally {
+    res.removeListener('close', onClientClose)
   }
 })
 

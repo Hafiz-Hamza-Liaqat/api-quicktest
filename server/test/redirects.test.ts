@@ -305,4 +305,126 @@ describe('Proxy Redirects and Security Integration Tests', () => {
     expect(echo.method).toBe('POST')
     expect(echo.receivedBody).toContain('preserved-value')
   })
+
+  it('rejects cross-origin redirect when X-Session-Id is present', async () => {
+    receivedHeadersAtC = null
+
+    const res = await fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${targetOriginB}/redirect/to-c`,
+        method: 'GET',
+        headers: {
+          'X-Session-Id': 'sess_xyz_secret_999',
+        },
+      }),
+    })
+
+    expect(res.status).toBe(403)
+    const json = await res.json()
+    expect(json.code).toBe('CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED')
+    expect(receivedHeadersAtC).toBeNull()
+  })
+
+  it('rejects cross-origin redirect when X-Client-Credential is present', async () => {
+    receivedHeadersAtC = null
+
+    const res = await fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${targetOriginB}/redirect/to-c`,
+        method: 'GET',
+        headers: {
+          'X-Client-Credential': 'cred_private_token',
+        },
+      }),
+    })
+
+    expect(res.status).toBe(403)
+    const json = await res.json()
+    expect(json.code).toBe('CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED')
+    expect(receivedHeadersAtC).toBeNull()
+  })
+
+  it('rejects cross-origin redirect when X-Internal-Key is present', async () => {
+    receivedHeadersAtC = null
+
+    const res = await fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${targetOriginB}/redirect/to-c`,
+        method: 'GET',
+        headers: {
+          'X-Internal-Key': 'internal_master_key',
+        },
+      }),
+    })
+
+    expect(res.status).toBe(403)
+    const json = await res.json()
+    expect(json.code).toBe('CROSS_ORIGIN_REDIRECT_CREDENTIALS_BLOCKED')
+    expect(receivedHeadersAtC).toBeNull()
+  })
+
+  it('safely handles oversized upstream response (>5MB) without crashing and keeps proxy healthy', async () => {
+    const res = await fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${proxyBaseUrl}/api/test/oversized`,
+        method: 'GET',
+      }),
+    })
+
+    expect(res.status).toBe(502)
+    const json = await res.json()
+    expect(json.code).toBe('RESPONSE_TOO_LARGE')
+    expect(json.error).toContain('5MB maximum')
+
+    // Verify proxy server remains healthy after oversized body error
+    const health = await fetch(`${proxyBaseUrl}/health`)
+    expect(health.status).toBe(200)
+    const healthJson = await health.json()
+    expect(healthJson.status).toBe('ok')
+  })
+
+  it('propagates client cancellation to upstream request and keeps proxy healthy', async () => {
+    const controller = new AbortController()
+
+    // Send request to slow streaming endpoint
+    const proxyPromise = fetch(`${proxyBaseUrl}/proxy`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: `${proxyBaseUrl}/api/test/slow-stream`,
+        method: 'GET',
+      }),
+      signal: controller.signal,
+    })
+
+    // Wait a brief moment to ensure upstream request was initiated
+    await new Promise((resolve) => setTimeout(resolve, 80))
+
+    // Client disconnects
+    controller.abort()
+
+    await expect(proxyPromise).rejects.toThrow()
+
+    // Wait for cleanup
+    await new Promise((resolve) => setTimeout(resolve, 250))
+
+    // Verify slow stream connection was terminated and cleaned up
+    const countRes = await fetch(`${proxyBaseUrl}/api/test/slow-stream/active-count`)
+    const countJson = await countRes.json()
+    expect(countJson.activeCount).toBe(0)
+
+    // Verify proxy server remains completely healthy
+    const health = await fetch(`${proxyBaseUrl}/health`)
+    expect(health.status).toBe(200)
+    const healthJson = await health.json()
+    expect(healthJson.status).toBe('ok')
+  })
 })

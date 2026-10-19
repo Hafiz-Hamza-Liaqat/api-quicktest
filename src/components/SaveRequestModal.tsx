@@ -104,7 +104,7 @@ export const SaveRequestModal: FC<SaveRequestModalProps> = ({
           <div className="flex items-start space-x-2 rounded-lg border border-gray-800 bg-[#0d1117] p-2.5 text-xs text-gray-400 html-light:border-gray-200 html-light:bg-gray-50">
             <ShieldCheck className="h-4 w-4 shrink-0 text-emerald-400" />
             <span>
-              <strong>Safe Storage:</strong> Tokens, passwords, and private API keys are automatically stripped before saving to keep your collections clean and shareable.
+              <strong>Safe Storage:</strong> Tokens, passwords, private API keys, and sensitive request bodies are automatically sanitized before saving to keep your collections clean and shareable.
             </span>
           </div>
         </div>
